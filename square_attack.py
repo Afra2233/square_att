@@ -2,14 +2,13 @@ import os
 import random
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Literal, Dict, Tuple, List
+from typing import Optional, Literal, Tuple
 
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
@@ -31,10 +30,35 @@ def set_seed(seed: int = 0):
 
 
 def get_class_list(name, ds):
-    # torchvision datasets differ; keep your original logic but be defensive
     if hasattr(ds, "classes"):
         return ds.classes
     raise RuntimeError(f"[FATAL] Dataset {name} has no .classes; please provide class names.")
+
+
+def make_subset_loader(
+    ds,
+    batch_size: int,
+    num_workers: int,
+    subset_size: int,
+    seed: int,
+) -> DataLoader:
+    n = len(ds)
+    g = torch.Generator()
+    g.manual_seed(seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    idx = perm[: min(subset_size, n)]
+    sampler = SubsetRandomSampler(idx)
+
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    return loader
 
 
 # =========================================================
@@ -75,9 +99,9 @@ class CLIPZeroShot(nn.Module):
 
 # =========================================================
 # Randomized Transform Defense (inference-time)
-# Matches paper idea: random crop-resize (80%) or random rotation (±10°)
+# We KEEP rotation_10 only (as you requested)
 # =========================================================
-TransformType = Literal["none", "crop_resize_80", "rotation_10"]
+TransformType = Literal["rotation_10"]
 
 
 @torch.no_grad()
@@ -89,75 +113,97 @@ def apply_random_transform_batch(
     Apply one random transform instance per image in batch.
     x: (B,3,H,W) in [0,1]
     """
-    if t == "none":
-        return x
-
     B, C, H, W = x.shape
     out = []
 
+    if t != "rotation_10":
+        raise ValueError(f"Unknown transform: {t}")
+
     for i in range(B):
         xi = x[i]
-
-        if t == "crop_resize_80":
-            # paper: crop to 80% then resize back, bilinear
-            # Use deterministic scale=0.8 exactly (not a range)
-            scale = 0.8
-            crop_h = int(round(H * scale))
-            crop_w = int(round(W * scale))
-            if crop_h < 1: crop_h = 1
-            if crop_w < 1: crop_w = 1
-
-            top = random.randint(0, H - crop_h) if H > crop_h else 0
-            left = random.randint(0, W - crop_w) if W > crop_w else 0
-
-            cropped = TF.crop(xi, top, left, crop_h, crop_w)
-            resized = TF.resize(
-                cropped,
-                size=[H, W],
-                interpolation=InterpolationMode.BILINEAR,
-                antialias=True
-            )
-            out.append(resized)
-
-        elif t == "rotation_10":
-            angle = random.uniform(-10.0, 10.0)
-            rotated = TF.rotate(
-                xi,
-                angle=angle,
-                interpolation=InterpolationMode.BILINEAR,
-                expand=False,
-                fill=0.0
-            )
-            out.append(rotated)
-
-        else:
-            raise ValueError(f"Unknown transform: {t}")
+        angle = random.uniform(-10.0, 10.0)
+        rotated = TF.rotate(
+            xi,
+            angle=angle,
+            interpolation=InterpolationMode.BILINEAR,
+            expand=False,
+            fill=0.0
+        )
+        out.append(rotated)
 
     return torch.stack(out, dim=0)
 
 
+# =========================================================
+# Similarity-Margin–Aware Voting (your only defense decision rule)
+# - do K_base passes
+# - if avg margin < tau, do K_extra more
+# - voting is margin-weighted (confidence-weighted)
+# =========================================================
 @torch.no_grad()
-def predict_with_voting(
+def predict_margin_aware(
     model: nn.Module,
     x: torch.Tensor,
     defense_t: TransformType,
-    vote_K: int,
-) -> torch.Tensor:
+    K_base: int = 10,
+    K_extra: int = 20,
+    margin_tau: float = 1.0,
+    weighted: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
-    Paper-style final prediction: aggregate multiple forward passes using voting.
-    Returns predicted labels (B,).
+    Returns:
+      pred_final: (B,) predicted labels
+      avg_margin: (B,) average margin over used passes
+      K_used: total passes used (K_base or K_base+K_extra)
     """
     B = x.size(0)
-    votes = torch.zeros((B, model(x[:1]).size(1)), device=x.device, dtype=torch.int32)
 
-    for _ in range(vote_K):
+    logits_list = []
+    margin_list = []
+
+    for _ in range(K_base):
         xt = apply_random_transform_batch(x, defense_t)
         logits = model(xt)
-        pred = logits.argmax(dim=1)
-        votes.scatter_add_(1, pred.view(-1, 1), torch.ones((B, 1), device=x.device, dtype=torch.int32))
+        logits_list.append(logits)
 
-    # majority vote
-    return votes.argmax(dim=1)
+        top2 = torch.topk(logits, k=2, dim=1).values  # (B,2)
+        margin = top2[:, 0] - top2[:, 1]              # (B,)
+        margin_list.append(margin)
+
+    margins = torch.stack(margin_list, dim=0)         # (K_base,B)
+    avg_margin = margins.mean(dim=0)                  # (B,)
+    uncertain = avg_margin < margin_tau
+
+    K_used = K_base
+    if uncertain.any() and K_extra > 0:
+        for _ in range(K_extra):
+            xt = apply_random_transform_batch(x, defense_t)
+            logits = model(xt)
+            logits_list.append(logits)
+
+            top2 = torch.topk(logits, k=2, dim=1).values
+            margin = top2[:, 0] - top2[:, 1]
+            margin_list.append(margin)
+
+        K_used = K_base + K_extra
+        avg_margin = torch.stack(margin_list, dim=0).mean(dim=0)
+
+    num_classes = logits_list[0].size(1)
+    votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32)
+
+    if weighted:
+        cap = 10.0  # prevent a few huge margins dominating too much
+        for logits, m in zip(logits_list, margin_list):
+            pred = logits.argmax(dim=1)
+            w = torch.clamp(m, min=0.0, max=cap).float()
+            votes.scatter_add_(1, pred.view(-1, 1), w.view(-1, 1))
+    else:
+        for logits in logits_list:
+            pred = logits.argmax(dim=1)
+            votes.scatter_add_(1, pred.view(-1, 1), torch.ones((B, 1), device=x.device))
+
+    pred_final = votes.argmax(dim=1)
+    return pred_final, avg_margin, K_used
 
 
 # =========================================================
@@ -165,7 +211,6 @@ def predict_with_voting(
 # f(x) = logit_true - max_{j!=y} logit_j  (minimize this)
 # =========================================================
 def margin_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    B, K = logits.shape
     true = logits.gather(1, y.view(-1, 1)).squeeze(1)
     tmp = logits.clone()
     tmp.scatter_(1, y.view(-1, 1), -1e9)
@@ -181,10 +226,9 @@ def eot_logits(
     eot_M: int,
 ) -> torch.Tensor:
     """
-    Attacker EOT: average logits over M random transform instances
-    (paper 4.2.1: average predictions before calculating directions).
+    Attacker EOT: average logits over M random transform instances.
     """
-    if eot_M <= 1 or t == "none":
+    if eot_M <= 1:
         return model(x)
 
     acc = None
@@ -196,28 +240,21 @@ def eot_logits(
 
 
 # =========================================================
-# Confident Square Attack (C-SQA) with EOT (paper Algorithm 1)
+# Confident Square Attack (C-SQA) with EOT
 # - runs full N iterations (no early stop)
-# - at each iteration: propose square patch update; accept if EOT margin loss decreases
 # =========================================================
 @dataclass
 class SquareAttackConfig:
     eps: float = 8/255
-    n_iters: int = 2000            # paper says 10,000 default; you likely lower for 1-day / 1 GPU
-    eot_M: int = 10                # EOT-10 or EOT-50
-    defense_transform_for_attacker: TransformType = "rotation_10"  # attacker sees same randomness used by defense
-    p_init: float = 0.8            # initial fraction of pixels perturbed in first phase (common square-attack knob)
+    n_iters: int = 500
+    eot_M: int = 5
+    defense_transform_for_attacker: TransformType = "rotation_10"
     min_square: int = 1
-    max_square: int = 32           # will be clamped to image size
+    max_square: int = 64
     seed: int = 0
 
 
 def square_size_schedule(i: int, n_iters: int, H: int, W: int, min_s: int, max_s: int) -> int:
-    """
-    Simple schedule: start big then shrink.
-    You can replace with the exact schedule from Andriushchenko et al. if you want.
-    """
-    # exponential decay-ish
     frac = 1.0 - (i / max(n_iters - 1, 1))
     s = int(round(min_s + (max_s - min_s) * (frac ** 2)))
     s = max(min_s, min(s, min(H, W)))
@@ -231,48 +268,37 @@ def confident_square_attack_eot(
     y: torch.Tensor,
     cfg: SquareAttackConfig,
 ) -> torch.Tensor:
-    """
-    Returns x_adv (B,3,H,W) in [0,1], within Linf eps around x.
-    """
     set_seed(cfg.seed)
 
-    device = x.device
     B, C, H, W = x.shape
     max_s = min(cfg.max_square, H, W)
 
-    # init: add random sign noise within eps and project
+    # init: random sign noise within eps
     x_adv = x + cfg.eps * torch.sign(torch.randn_like(x))
     x_adv = torch.max(torch.min(x_adv, x + cfg.eps), x - cfg.eps)
     x_adv = x_adv.clamp(0.0, 1.0)
 
-    # initial best loss (EOT)
     logits0 = eot_logits(model, x_adv, cfg.defense_transform_for_attacker, cfg.eot_M)
     best = margin_loss(logits0, y)  # (B,)
-    # loop (no early stop)
+
     for i in range(cfg.n_iters):
         s = square_size_schedule(i, cfg.n_iters, H, W, cfg.min_square, max_s)
 
-        # propose delta: modify a random square per sample
         x_new = x_adv.clone()
         for b in range(B):
             top = random.randint(0, H - s) if H > s else 0
             left = random.randint(0, W - s) if W > s else 0
 
-            # square attack style: set patch to either x +/- eps (randomly)
             patch_sign = 1.0 if random.random() < 0.5 else -1.0
-            # propose to push patch towards the boundary around x (not around current adv)
             patch = (x[b, :, top:top+s, left:left+s] + patch_sign * cfg.eps).clamp(0.0, 1.0)
             x_new[b, :, top:top+s, left:left+s] = patch
 
-        # project back to Linf ball around original x
         x_new = torch.max(torch.min(x_new, x + cfg.eps), x - cfg.eps)
         x_new = x_new.clamp(0.0, 1.0)
 
-        # EOT loss
         logits_new = eot_logits(model, x_new, cfg.defense_transform_for_attacker, cfg.eot_M)
         loss_new = margin_loss(logits_new, y)
 
-        # accept if better (lower margin loss)
         improved = loss_new < best
         if improved.any():
             x_adv[improved] = x_new[improved]
@@ -282,28 +308,40 @@ def confident_square_attack_eot(
 
 
 # =========================================================
-# Evaluation (paper-style):
-# - Attack uses EOT to craft adversarial examples
-# - Success check uses defense voting over K predictions
+# Evaluation
+# - Clean/Robust prediction uses margin-aware decision rule (your defense)
+# - Attack uses confident square + EOT
+# - Evaluate on RANDOMLY SAMPLED 1000 samples per dataset
 # =========================================================
 @torch.no_grad()
-def eval_paper_style(
+def eval_smav(
     name: str,
     ds,
     clip_model,
     device: str,
     text_features: torch.Tensor,
     defense_transform: TransformType,
-    vote_K: int,
     attack_cfg: SquareAttackConfig,
-    batch_size: int = 16,
+    batch_size: int = 32,
     num_workers: int = 4,
-    max_samples: Optional[int] = None,   # for quick subset runs
+    subset_size: int = 1000,
+    subset_seed: int = 0,
+    K_base: int = 10,
+    K_extra: int = 20,
+    margin_tau: float = 1.0,
 ):
-    print(f"\n===== {name} | Defense={defense_transform} | VoteK={vote_K} | Attack=Square(EOT-{attack_cfg.eot_M}, iters={attack_cfg.n_iters}, eps={attack_cfg.eps}) =====")
+    print(
+        f"\n===== {name} | Defense={defense_transform} | SMAV(K_base={K_base},K_extra={K_extra},tau={margin_tau}) "
+        f"| Attack=Square(EOT-{attack_cfg.eot_M}, iters={attack_cfg.n_iters}, eps={attack_cfg.eps}) | subset={subset_size} ====="
+    )
 
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                        pin_memory=True, drop_last=False)
+    loader = make_subset_loader(
+        ds=ds,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        subset_size=subset_size,
+        seed=subset_seed,
+    )
 
     model = CLIPZeroShot(clip_model, text_features, device).to(device).eval().float()
 
@@ -313,25 +351,31 @@ def eval_paper_style(
     attacked_success_on_clean = 0
     clean_correct_count = 0
 
+    # for reporting efficiency/uncertainty
+    sum_k_clean = 0
+    sum_k_adv = 0
+    sum_margin_clean = 0.0
+    sum_margin_adv = 0.0
+
     for images, labels in tqdm(loader, desc=f"{name}-eval", ncols=120):
         images = images.to(device, non_blocking=True).float()
         labels = labels.to(device, non_blocking=True).long()
 
-        if max_samples is not None and total >= max_samples:
-            break
-        if max_samples is not None and total + images.size(0) > max_samples:
-            images = images[: max_samples - total]
-            labels = labels[: max_samples - total]
-
-        # Clean prediction with defense voting (paper uses voting for random-transform defenses)
-        pred_clean = predict_with_voting(model, images, defense_transform, vote_K)
+        # Clean prediction (SMAV)
+        pred_clean, m_clean, k_used_clean = predict_margin_aware(
+            model, images, defense_transform,
+            K_base=K_base, K_extra=K_extra, margin_tau=margin_tau, weighted=True
+        )
         cc = (pred_clean == labels)
 
-        # Craft adversarial examples with attacker EOT (attacker sees same defense randomness type)
+        # Attack
         x_adv = confident_square_attack_eot(model, images, labels, attack_cfg)
 
-        # Robust prediction: defense voting on adversarial examples
-        pred_adv = predict_with_voting(model, x_adv, defense_transform, vote_K)
+        # Robust prediction (SMAV)
+        pred_adv, m_adv, k_used_adv = predict_margin_aware(
+            model, x_adv, defense_transform,
+            K_base=K_base, K_extra=K_extra, margin_tau=margin_tau, weighted=True
+        )
         rc = (pred_adv == labels)
 
         n = labels.numel()
@@ -342,6 +386,11 @@ def eval_paper_style(
         clean_correct_count += cc.sum().item()
         attacked_success_on_clean += ((~rc) & cc).sum().item()
 
+        sum_k_clean += int(k_used_clean) * n
+        sum_k_adv += int(k_used_adv) * n
+        sum_margin_clean += float(m_clean.mean().item()) * n
+        sum_margin_adv += float(m_adv.mean().item()) * n
+
         if device == "cuda":
             torch.cuda.empty_cache()
 
@@ -349,12 +398,21 @@ def eval_paper_style(
     robust_acc = robust_correct / max(total, 1)
     asr = attacked_success_on_clean / (clean_correct_count + 1e-12)
 
+    avg_k_clean = sum_k_clean / max(total, 1)
+    avg_k_adv = sum_k_adv / max(total, 1)
+    avg_margin_clean = sum_margin_clean / max(total, 1)
+    avg_margin_adv = sum_margin_adv / max(total, 1)
+
     print(f"\nRESULT: {name}")
-    print(f"Samples:          {total}")
-    print(f"Clean Accuracy:   {clean_acc:.4f}")
-    print(f"Robust Accuracy:  {robust_acc:.4f}")
+    print(f"Samples (subset):      {total}")
+    print(f"Clean Accuracy:        {clean_acc:.4f}")
+    print(f"Robust Accuracy:       {robust_acc:.4f}")
     print(f"ASR(on clean-correct): {asr:.4f}")
-    print("=" * 70 + "\n")
+    print(f"Avg K used (clean):    {avg_k_clean:.2f}")
+    print(f"Avg K used (adv):      {avg_k_adv:.2f}")
+    print(f"Avg margin (clean):    {avg_margin_clean:.3f}")
+    print(f"Avg margin (adv):      {avg_margin_adv:.3f}")
+    print("=" * 80 + "\n")
 
     return clean_acc, robust_acc, asr
 
@@ -370,7 +428,6 @@ def main():
     clip_model, _ = clip.load("ViT-B/32", device=device, jit=False)
     clip_model = clip_model.eval().float()
 
-    # Dataset: output [0,1], resize to 224 for CLIP
     transform = transforms.Compose([
         transforms.Resize((224, 224), interpolation=InterpolationMode.BILINEAR, antialias=True),
         transforms.ToTensor(),
@@ -386,50 +443,50 @@ def main():
         "stl10": STL10(f"{DATA_ROOT}/stl10", split="test", download=True, transform=transform),
     }
 
-    # ===== Paper-style knobs =====
-    # Defense voting K: paper uses 10 for EOT-10 setting (and 50 for EOT-50 in some places)
-    vote_K = 10
+    # ===== Your requested setup =====
+    defense_transform: TransformType = "rotation_10"
 
-    # Choose ONE defense to run (paper compares crop-resize and rotation; run both if time)
-    defenses = ["rotation_10", "crop_resize_80"]  # or just one
+    # SMAV hyperparams (small and safe)
+    K_base = 10
+    K_extra = 20
+    margin_tau = 1.0  # if too slow (always uncertain), try 0.5; if rarely uncertain, try 2.0
 
-    # Attack config: "confident square attack" + EOT
-    # NOTE: paper runs 10,000 iters; for feasibility, start smaller (e.g., 2000) then scale up.
+    # Attack config
     attack_cfg = SquareAttackConfig(
-        eps=8/255,                 # set to what you want (paper sometimes uses 12.75/255)
-        n_iters=2000,              # you can increase if you have time
-        eot_M=10,                  # EOT-10
-        defense_transform_for_attacker="rotation_10",  # set per-defense in loop below
+        eps=8/255,
+        n_iters=500,
+        eot_M=5,  # for time; set to 10 if you can afford it
+        defense_transform_for_attacker=defense_transform,
         min_square=1,
         max_square=64,
         seed=0
     )
 
-    batch_size = 16
-    max_samples = None  # set e.g. 200 for quick run
+    batch_size = 32
+    subset_size = 1000
+    subset_seed = 0  # keep fixed for reproducibility
 
     for name, ds in datasets.items():
         print(f"\nPreparing: {name}")
         class_names = get_class_list(name, ds)
         text_features = build_text_features(class_names, clip_model, device)
 
-        for d in defenses:
-            # attacker should match the defense randomness type (EOT over that transform)
-            attack_cfg.defense_transform_for_attacker = d  # important
-
-            eval_paper_style(
-                name=f"{name}",
-                ds=ds,
-                clip_model=clip_model,
-                device=device,
-                text_features=text_features,
-                defense_transform=d,
-                vote_K=vote_K,
-                attack_cfg=attack_cfg,
-                batch_size=batch_size,
-                num_workers=4,
-                max_samples=max_samples,
-            )
+        eval_smav(
+            name=name,
+            ds=ds,
+            clip_model=clip_model,
+            device=device,
+            text_features=text_features,
+            defense_transform=defense_transform,
+            attack_cfg=attack_cfg,
+            batch_size=batch_size,
+            num_workers=4,
+            subset_size=subset_size,
+            subset_seed=subset_seed,
+            K_base=K_base,
+            K_extra=K_extra,
+            margin_tau=margin_tau,
+        )
 
 
 if __name__ == "__main__":
