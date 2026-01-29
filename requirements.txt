@@ -1,0 +1,21 @@
+torch
+torchvision
+git+https://github.com/openai/CLIP.git
+Pillow
+opencv-python
+matplotlib
+tqdm
+numpy
+scikit-image
+scipy
+
+# Flowers102, Food101, DTD, OxfordIIITPet may depend on these:
+requests
+
+# ---- Huggingface tokenizer dependency (CLIP also uses this indirectly) ----
+regex
+ftfy
+
+# ---- Optional but useful ----
+pandas
+h5py
