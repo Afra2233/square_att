@@ -2,7 +2,7 @@ import os
 import random
 import numpy as np
 from dataclasses import dataclass, replace
-from typing import Optional, Literal, Tuple
+from typing import Literal, Tuple, Dict
 
 from tqdm import tqdm
 
@@ -74,7 +74,7 @@ def build_text_features(class_names, clip_model, device):
 
 
 # =========================================================
-# CLIP Zero-shot Classifier (deterministic given x)
+# CLIP Zero-shot Classifier
 # x is in [0,1] and shape (B,3,224,224)
 # =========================================================
 class CLIPZeroShot(nn.Module):
@@ -83,7 +83,6 @@ class CLIPZeroShot(nn.Module):
         self.clip_model = clip_model
         self.text_features = text_features.to(device)
 
-        # CLIP normalize buffer (expects input in [0,1])
         mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], dtype=torch.float32).view(1, 3, 1, 1)
         std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], dtype=torch.float32).view(1, 3, 1, 1)
         self.register_buffer("mean", mean.to(device))
@@ -99,16 +98,15 @@ class CLIPZeroShot(nn.Module):
 
 # =========================================================
 # Randomized Transform Defense (inference-time)
-# We KEEP rotation_10 only
+# We provide:
+#   - rotation_10: random angle in [-10,10]
+#   - crop_resize_80: random crop (scale in [0.8, 1.0]) then resize back
 # =========================================================
-TransformType = Literal["rotation_10"]
+TransformType = Literal["rotation_10", "crop_resize_80"]
 
 
 @torch.no_grad()
-def apply_random_transform_batch(
-    x: torch.Tensor,
-    t: TransformType,
-) -> torch.Tensor:
+def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Tensor:
     """
     Apply one random transform instance per image in batch.
     x: (B,3,H,W) in [0,1]
@@ -116,94 +114,76 @@ def apply_random_transform_batch(
     B, C, H, W = x.shape
     out = []
 
-    if t != "rotation_10":
-        raise ValueError(f"Unknown transform: {t}")
-
     for i in range(B):
         xi = x[i]
-        angle = random.uniform(-10.0, 10.0)
-        rotated = TF.rotate(
-            xi,
-            angle=angle,
-            interpolation=InterpolationMode.BILINEAR,
-            expand=False,
-            fill=0.0
-        )
-        out.append(rotated)
+
+        if t == "rotation_10":
+            angle = random.uniform(-10.0, 10.0)
+            xo = TF.rotate(
+                xi,
+                angle=angle,
+                interpolation=InterpolationMode.BILINEAR,
+                expand=False,
+                fill=0.0
+            )
+
+        elif t == "crop_resize_80":
+            # random crop scale in [0.8, 1.0], aspect ratio fixed to 1.0 for simplicity & stability
+            scale = random.uniform(0.8, 1.0)
+            ch = max(1, int(round(H * scale)))
+            cw = max(1, int(round(W * scale)))
+            top = random.randint(0, H - ch) if H > ch else 0
+            left = random.randint(0, W - cw) if W > cw else 0
+            cropped = xi[:, top:top+ch, left:left+cw]
+            xo = TF.resize(
+                cropped, size=[H, W],
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True
+            )
+        else:
+            raise ValueError(f"Unknown transform: {t}")
+
+        out.append(xo.clamp(0.0, 1.0))
 
     return torch.stack(out, dim=0)
 
 
 # =========================================================
-# Similarity-Margin–Aware Voting (SMAV)
-# - do K_base passes
-# - if avg margin < tau, do K_extra more
-# - voting is margin-weighted
+# Majority Vote Aggregation (paper-style)
+# - sample K transformed variants
+# - take argmax each time
+# - final pred is mode (ties broken by summed logits over tied classes)
 # =========================================================
 @torch.no_grad()
-def predict_margin_aware(
+def predict_majority_vote(
     model: nn.Module,
     x: torch.Tensor,
     defense_t: TransformType,
-    K_base: int = 10,
-    K_extra: int = 20,
-    margin_tau: float = 1.0,
-    weighted: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    K: int = 10,
+) -> torch.Tensor:
     """
     Returns:
-      pred_final: (B,) predicted labels
-      avg_margin: (B,) average margin over used passes
-      K_used: total passes used (K_base or K_base+K_extra)
+      pred_final: (B,)
     """
     B = x.size(0)
+    num_classes = model(x[:1]).size(1)  # one forward to get C (cheap)
+    votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.int32)
+    logits_sum = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32)
 
-    logits_list = []
-    margin_list = []
-
-    for _ in range(K_base):
+    for _ in range(K):
         xt = apply_random_transform_batch(x, defense_t)
-        logits = model(xt)
-        logits_list.append(logits)
+        logits = model(xt)  # (B,C)
+        pred = logits.argmax(dim=1)  # (B,)
+        votes.scatter_add_(1, pred.view(-1, 1), torch.ones((B, 1), device=x.device, dtype=torch.int32))
+        logits_sum += logits
 
-        top2 = torch.topk(logits, k=2, dim=1).values  # (B,2)
-        margin = top2[:, 0] - top2[:, 1]              # (B,)
-        margin_list.append(margin)
-
-    margins = torch.stack(margin_list, dim=0)         # (K_base,B)
-    avg_margin = margins.mean(dim=0)                  # (B,)
-    uncertain = avg_margin < margin_tau
-
-    K_used = K_base
-    if uncertain.any() and K_extra > 0:
-        for _ in range(K_extra):
-            xt = apply_random_transform_batch(x, defense_t)
-            logits = model(xt)
-            logits_list.append(logits)
-
-            top2 = torch.topk(logits, k=2, dim=1).values
-            margin = top2[:, 0] - top2[:, 1]
-            margin_list.append(margin)
-
-        K_used = K_base + K_extra
-        avg_margin = torch.stack(margin_list, dim=0).mean(dim=0)
-
-    num_classes = logits_list[0].size(1)
-    votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32)
-
-    if weighted:
-        cap = 10.0
-        for logits, m in zip(logits_list, margin_list):
-            pred = logits.argmax(dim=1)
-            w = torch.clamp(m, min=0.0, max=cap).float()
-            votes.scatter_add_(1, pred.view(-1, 1), w.view(-1, 1))
-    else:
-        for logits in logits_list:
-            pred = logits.argmax(dim=1)
-            votes.scatter_add_(1, pred.view(-1, 1), torch.ones((B, 1), device=x.device))
-
-    pred_final = votes.argmax(dim=1)
-    return pred_final, avg_margin, K_used
+    # majority class (ties resolved by logits_sum among tied classes)
+    max_votes = votes.max(dim=1, keepdim=True).values  # (B,1)
+    tied = (votes == max_votes)  # (B,C) bool
+    # set logits of non-tied classes to -inf so argmax picks among ties
+    logits_tie = logits_sum.masked_fill(~tied, float("-inf"))
+    pred_final = logits_tie.argmax(dim=1)
+    return pred_final
 
 
 # =========================================================
@@ -268,7 +248,6 @@ def confident_square_attack_eot(
     y: torch.Tensor,
     cfg: SquareAttackConfig,
 ) -> torch.Tensor:
-    # IMPORTANT: seed is set here; pass different cfg.seed per batch for reproducibility + diversity
     set_seed(cfg.seed)
 
     B, C, H, W = x.shape
@@ -310,32 +289,30 @@ def confident_square_attack_eot(
 
 # =========================================================
 # Evaluation
-# - We report:
-#   (1) Undefended Clean Acc:   model(images)
-#   (2) Defended Clean Acc:     SMAV(model, images)
-#   (3) Undefended Robust Acc:  model(x_adv)
-#   (4) Defended Robust Acc:    SMAV(model, x_adv)
+# - report:
+#   (1) Undefended clean acc: model(images)
+#   (2) Undefended robust acc: model(x_adv)  (x_adv crafted vs chosen defense transform via cfg)
+#   (3) Defended clean/robust for each defense transform with majority vote
 # =========================================================
 @torch.no_grad()
-def eval_smav(
+def eval_defenses_majority_vote(
     name: str,
     ds,
     clip_model,
     device: str,
     text_features: torch.Tensor,
-    defense_transform: TransformType,
-    attack_cfg: SquareAttackConfig,
+    defenses: Tuple[TransformType, ...],
+    attack_cfg_base: SquareAttackConfig,
     batch_size: int = 32,
     num_workers: int = 4,
     subset_size: int = 1000,
     subset_seed: int = 0,
-    K_base: int = 10,
-    K_extra: int = 20,
-    margin_tau: float = 1.0,
+    K_vote_clean: int = 10,
+    K_vote_adv: int = 10,
 ):
     print(
-        f"\n===== {name} | Defense={defense_transform} | SMAV(K_base={K_base},K_extra={K_extra},tau={margin_tau}) "
-        f"| Attack=Square(EOT-{attack_cfg.eot_M}, iters={attack_cfg.n_iters}, eps={attack_cfg.eps}) | subset={subset_size} ====="
+        f"\n===== {name} | Defenses={defenses} | Vote(K_clean={K_vote_clean},K_adv={K_vote_adv}) "
+        f"| Attack=Conf-Square(EOT-{attack_cfg_base.eot_M}, iters={attack_cfg_base.n_iters}, eps={attack_cfg_base.eps}) | subset={subset_size} ====="
     )
 
     loader = make_subset_loader(
@@ -349,33 +326,22 @@ def eval_smav(
     model = CLIPZeroShot(clip_model, text_features, device).to(device).eval().float()
 
     total = 0
-
-    # (A) undefended clean
     undef_clean_correct = 0
 
-    # (B) defended clean (your current "clean accuracy")
-    def_clean_correct = 0
+    # per-defense stats
+    stats: Dict[str, Dict[str, float]] = {}
+    for d in defenses:
+        stats[d] = {
+            "def_clean_correct": 0,
+            "def_robust_correct": 0,
+            "asr_def_num": 0,     # among def-clean-correct, how many become wrong under defense after attack
+            "def_clean_ok": 0,
+        }
 
-    # (C) undefended robust (on adv)
-    undef_robust_correct = 0
-
-    # (D) defended robust (your current "robust accuracy")
-    def_robust_correct = 0
-
-    # ASR definitions
-    # ASR_def: among defended-clean-correct, how many become wrong after attack under defense?
-    attacked_success_on_defclean = 0
-    defclean_correct_count = 0
-
-    # optional: ASR_undef: among undefended-clean-correct, how many become wrong after attack under undefended?
-    attacked_success_on_undefclean = 0
-    undefclean_correct_count = 0
-
-    # efficiency/uncertainty stats for SMAV
-    sum_k_clean = 0
-    sum_k_adv = 0
-    sum_margin_clean = 0.0
-    sum_margin_adv = 0.0
+    # optional: undef robust (but note: x_adv is crafted vs a chosen defense transform; we report per-defense undef robust as well)
+    undef_robust_correct_per_def: Dict[str, int] = {d: 0 for d in defenses}
+    asr_undef_num_per_def: Dict[str, int] = {d: 0 for d in defenses}
+    undef_clean_ok = 0
 
     for batch_idx, (images, labels) in enumerate(tqdm(loader, desc=f"{name}-eval", ncols=120)):
         images = images.to(device, non_blocking=True).float()
@@ -383,96 +349,73 @@ def eval_smav(
         n = labels.numel()
         total += n
 
-        # ---------- (A) Undefended clean ----------
+        # ---------- Undefended clean ----------
         logits_uc = model(images)
         pred_uc = logits_uc.argmax(dim=1)
         uc = (pred_uc == labels)
         undef_clean_correct += uc.sum().item()
+        undef_clean_ok += uc.sum().item()
 
-        # ---------- (B) Defended clean (SMAV) ----------
-        pred_dc, m_clean, k_used_clean = predict_margin_aware(
-            model, images, defense_transform,
-            K_base=K_base, K_extra=K_extra, margin_tau=margin_tau, weighted=True
-        )
-        dc = (pred_dc == labels)
-        def_clean_correct += dc.sum().item()
+        # For each defense, we:
+        #   (1) compute defended clean by majority vote
+        #   (2) craft x_adv against that defense via EOT on its transform
+        #   (3) measure undefended robust on that x_adv (for ASR_undef fairness per-defense)
+        #   (4) measure defended robust by majority vote
+        for d in defenses:
+            # (1) defended clean
+            pred_dc = predict_majority_vote(model, images, d, K=K_vote_clean)
+            dc = (pred_dc == labels)
+            stats[d]["def_clean_correct"] += dc.sum().item()
+            stats[d]["def_clean_ok"] += dc.sum().item()
 
-        defclean_correct_count += dc.sum().item()
-        undefclean_correct_count += uc.sum().item()
+            # (2) craft adversarial examples adaptive to this defense transform
+            cfg_b = replace(
+                attack_cfg_base,
+                seed=int(attack_cfg_base.seed) + int(batch_idx),
+                defense_transform_for_attacker=d
+            )
+            x_adv = confident_square_attack_eot(model, images, labels, cfg_b)
 
-        sum_k_clean += int(k_used_clean) * n
-        sum_margin_clean += float(m_clean.mean().item()) * n
+            # (3) undefended robust on x_adv (crafted vs defense d)
+            logits_ur = model(x_adv)
+            pred_ur = logits_ur.argmax(dim=1)
+            ur = (pred_ur == labels)
+            undef_robust_correct_per_def[d] += ur.sum().item()
+            asr_undef_num_per_def[d] += ((~ur) & uc).sum().item()
 
-        # ---------- Attack (produce adversarial examples) ----------
-        # make batch-wise deterministic but not identical across batches
-        cfg_b = replace(attack_cfg, seed=int(attack_cfg.seed) + int(batch_idx))
-        x_adv = confident_square_attack_eot(model, images, labels, cfg_b)
-
-        # ---------- (C) Undefended robust (on adv) ----------
-        logits_ur = model(x_adv)
-        pred_ur = logits_ur.argmax(dim=1)
-        ur = (pred_ur == labels)
-        undef_robust_correct += ur.sum().item()
-
-        # ASR_undef: among undefended-clean-correct, how many become wrong under undefended after attack?
-        attacked_success_on_undefclean += ((~ur) & uc).sum().item()
-
-        # ---------- (D) Defended robust (SMAV on adv) ----------
-        pred_dr, m_adv, k_used_adv = predict_margin_aware(
-            model, x_adv, defense_transform,
-            K_base=K_base, K_extra=K_extra, margin_tau=margin_tau, weighted=True
-        )
-        dr = (pred_dr == labels)
-        def_robust_correct += dr.sum().item()
-
-        # ASR_def: among defended-clean-correct, how many become wrong under defense after attack?
-        attacked_success_on_defclean += ((~dr) & dc).sum().item()
-
-        sum_k_adv += int(k_used_adv) * n
-        sum_margin_adv += float(m_adv.mean().item()) * n
+            # (4) defended robust on x_adv
+            pred_dr = predict_majority_vote(model, x_adv, d, K=K_vote_adv)
+            dr = (pred_dr == labels)
+            stats[d]["def_robust_correct"] += dr.sum().item()
+            stats[d]["asr_def_num"] += ((~dr) & dc).sum().item()
 
         if device == "cuda":
             torch.cuda.empty_cache()
 
-    # ---------- metrics ----------
+    # ---------- print results ----------
     undef_clean_acc = undef_clean_correct / max(total, 1)
-    def_clean_acc = def_clean_correct / max(total, 1)
-
-    undef_robust_acc = undef_robust_correct / max(total, 1)
-    def_robust_acc = def_robust_correct / max(total, 1)
-
-    asr_def = attacked_success_on_defclean / (defclean_correct_count + 1e-12)
-    asr_undef = attacked_success_on_undefclean / (undefclean_correct_count + 1e-12)
-
-    avg_k_clean = sum_k_clean / max(total, 1)
-    avg_k_adv = sum_k_adv / max(total, 1)
-    avg_margin_clean = sum_margin_clean / max(total, 1)
-    avg_margin_adv = sum_margin_adv / max(total, 1)
 
     print(f"\nRESULT: {name}")
     print(f"Samples (subset):           {total}")
     print(f"Undefended Clean Accuracy:  {undef_clean_acc:.4f}")
-    print(f"Defended  Clean Accuracy:   {def_clean_acc:.4f}")
-    print(f"Undefended Robust Accuracy: {undef_robust_acc:.4f}   (on adversarial x_adv)")
-    print(f"Defended  Robust Accuracy:  {def_robust_acc:.4f}   (SMAV on adversarial x_adv)")
-    print(f"ASR_def (on def-clean-ok):  {asr_def:.4f}")
-    print(f"ASR_undef(on undef-clean):  {asr_undef:.4f}")
-    print(f"Avg K used (clean/adv):     {avg_k_clean:.2f} / {avg_k_adv:.2f}")
-    print(f"Avg margin (clean/adv):     {avg_margin_clean:.3f} / {avg_margin_adv:.3f}")
-    print("=" * 80 + "\n")
 
-    return {
-        "undef_clean_acc": undef_clean_acc,
-        "def_clean_acc": def_clean_acc,
-        "undef_robust_acc": undef_robust_acc,
-        "def_robust_acc": def_robust_acc,
-        "asr_def": asr_def,
-        "asr_undef": asr_undef,
-        "avg_k_clean": avg_k_clean,
-        "avg_k_adv": avg_k_adv,
-        "avg_margin_clean": avg_margin_clean,
-        "avg_margin_adv": avg_margin_adv,
-    }
+    for d in defenses:
+        def_clean_acc = stats[d]["def_clean_correct"] / max(total, 1)
+        def_robust_acc = stats[d]["def_robust_correct"] / max(total, 1)
+
+        undef_robust_acc = undef_robust_correct_per_def[d] / max(total, 1)
+
+        asr_def = stats[d]["asr_def_num"] / (stats[d]["def_clean_ok"] + 1e-12)
+        asr_undef = asr_undef_num_per_def[d] / (undef_clean_ok + 1e-12)
+
+        print(f"\n--- Defense: {d} ---")
+        print(f"Defended  Clean Accuracy:   {def_clean_acc:.4f}  (MajorityVote K={K_vote_clean})")
+        print(f"Undefended Robust Accuracy: {undef_robust_acc:.4f}  (on x_adv crafted vs {d})")
+        print(f"Defended  Robust Accuracy:  {def_robust_acc:.4f}  (MajorityVote K={K_vote_adv} on x_adv crafted vs {d})")
+        print(f"ASR_def   (on def-clean-ok): {asr_def:.4f}")
+        print(f"ASR_undef (on undef-clean):  {asr_undef:.4f}")
+
+    print("=" * 80 + "\n")
 
 
 # =========================================================
@@ -501,19 +444,14 @@ def main():
         "stl10": STL10(f"{DATA_ROOT}/stl10", split="test", download=True, transform=transform),
     }
 
-    defense_transform: TransformType = "rotation_10"
+    defenses: Tuple[TransformType, ...] = ("crop_resize_80", "rotation_10")
 
-    # SMAV hyperparams (low-budget)
-    K_base = 10
-    K_extra = 20
-    margin_tau = 1.0
-
-    # Attack config (low-budget)
+    # Attack config (low-budget; you can scale up later)
     attack_cfg = SquareAttackConfig(
         eps=8/255,
-        n_iters=500,
-        eot_M=5,
-        defense_transform_for_attacker=defense_transform,
+        n_iters=2000,
+        eot_M=10,
+        defense_transform_for_attacker="rotation_10",  # will be overridden per-defense
         min_square=1,
         max_square=64,
         seed=0
@@ -523,28 +461,32 @@ def main():
     subset_size = 1000
     subset_seed = 0
 
+    # Voting K: in the paper they use 10 or 50 depending on EOT, but you can keep it small.
+    K_vote_clean = 10
+    K_vote_adv = 10
+
     for name, ds in datasets.items():
         print(f"\nPreparing: {name}")
         class_names = get_class_list(name, ds)
         text_features = build_text_features(class_names, clip_model, device)
 
-        eval_smav(
+        eval_defenses_majority_vote(
             name=name,
             ds=ds,
             clip_model=clip_model,
             device=device,
             text_features=text_features,
-            defense_transform=defense_transform,
-            attack_cfg=attack_cfg,
+            defenses=defenses,
+            attack_cfg_base=attack_cfg,
             batch_size=batch_size,
             num_workers=4,
             subset_size=subset_size,
             subset_seed=subset_seed,
-            K_base=K_base,
-            K_extra=K_extra,
-            margin_tau=margin_tau,
+            K_vote_clean=K_vote_clean,
+            K_vote_adv=K_vote_adv,
         )
 
 
 if __name__ == "__main__":
     main()
+
