@@ -449,7 +449,7 @@ def main():
     # Attack config (low-budget; you can scale up later)
     attack_cfg = SquareAttackConfig(
         eps=8/255,
-        n_iters=2000,
+        n_iters=500,
         eot_M=10,
         defense_transform_for_attacker="rotation_10",  # will be overridden per-defense
         min_square=1,
