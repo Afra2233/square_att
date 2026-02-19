@@ -98,11 +98,11 @@ class CLIPZeroShot(nn.Module):
 
 # =========================================================
 # Randomized Transform Defense (inference-time)
-# We provide:
-#   - rotation_10: random angle in [-10,10]
-#   - crop_resize_80: random crop (scale in [0.8, 1.0]) then resize back
+# identity: no transform (for fair "undefended adaptive" baseline attack)
+# rotation_10: random angle in [-10,10]
+# crop_resize_80: random crop scale in [0.8, 1.0] then resize back
 # =========================================================
-TransformType = Literal["rotation_10", "crop_resize_80"]
+TransformType = Literal["identity", "rotation_10", "crop_resize_80"]
 
 
 @torch.no_grad()
@@ -111,6 +111,9 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
     Apply one random transform instance per image in batch.
     x: (B,3,H,W) in [0,1]
     """
+    if t == "identity":
+        return x
+
     B, C, H, W = x.shape
     out = []
 
@@ -119,16 +122,17 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
 
         if t == "rotation_10":
             angle = random.uniform(-10.0, 10.0)
+            # IMPORTANT: fill=0 creates black corners which hurts CLIP; use per-image mean fill
+            fill = float(xi.mean().item())
             xo = TF.rotate(
                 xi,
                 angle=angle,
                 interpolation=InterpolationMode.BILINEAR,
                 expand=False,
-                fill=0.0
+                fill=fill
             )
 
         elif t == "crop_resize_80":
-            # random crop scale in [0.8, 1.0], aspect ratio fixed to 1.0 for simplicity & stability
             scale = random.uniform(0.8, 1.0)
             ch = max(1, int(round(H * scale)))
             cw = max(1, int(round(W * scale)))
@@ -136,7 +140,8 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
             left = random.randint(0, W - cw) if W > cw else 0
             cropped = xi[:, top:top+ch, left:left+cw]
             xo = TF.resize(
-                cropped, size=[H, W],
+                cropped,
+                size=[H, W],
                 interpolation=InterpolationMode.BILINEAR,
                 antialias=True
             )
@@ -152,7 +157,7 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
 # Majority Vote Aggregation (paper-style)
 # - sample K transformed variants
 # - take argmax each time
-# - final pred is mode (ties broken by summed logits over tied classes)
+# - final pred is mode (ties broken by summed logits among tied classes)
 # =========================================================
 @torch.no_grad()
 def predict_majority_vote(
@@ -166,7 +171,9 @@ def predict_majority_vote(
       pred_final: (B,)
     """
     B = x.size(0)
-    num_classes = model(x[:1]).size(1)  # one forward to get C (cheap)
+
+    # One forward to get number of classes (cheap, but keep it on same device)
+    num_classes = model(x[:1]).size(1)
     votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.int32)
     logits_sum = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32)
 
@@ -177,10 +184,8 @@ def predict_majority_vote(
         votes.scatter_add_(1, pred.view(-1, 1), torch.ones((B, 1), device=x.device, dtype=torch.int32))
         logits_sum += logits
 
-    # majority class (ties resolved by logits_sum among tied classes)
-    max_votes = votes.max(dim=1, keepdim=True).values  # (B,1)
-    tied = (votes == max_votes)  # (B,C) bool
-    # set logits of non-tied classes to -inf so argmax picks among ties
+    max_votes = votes.max(dim=1, keepdim=True).values
+    tied = (votes == max_votes)
     logits_tie = logits_sum.masked_fill(~tied, float("-inf"))
     pred_final = logits_tie.argmax(dim=1)
     return pred_final
@@ -207,8 +212,9 @@ def eot_logits(
 ) -> torch.Tensor:
     """
     Attacker EOT: average logits over M random transform instances.
+    For identity, M=1 is sufficient.
     """
-    if eot_M <= 1:
+    if t == "identity" or eot_M <= 1:
         return model(x)
 
     acc = None
@@ -227,8 +233,8 @@ def eot_logits(
 class SquareAttackConfig:
     eps: float = 8/255
     n_iters: int = 500
-    eot_M: int = 5
-    defense_transform_for_attacker: TransformType = "rotation_10"
+    eot_M: int = 10
+    defense_transform_for_attacker: TransformType = "identity"
     min_square: int = 1
     max_square: int = 64
     seed: int = 0
@@ -248,6 +254,7 @@ def confident_square_attack_eot(
     y: torch.Tensor,
     cfg: SquareAttackConfig,
 ) -> torch.Tensor:
+    # make deterministic per call (pass different cfg.seed per batch)
     set_seed(cfg.seed)
 
     B, C, H, W = x.shape
@@ -288,14 +295,18 @@ def confident_square_attack_eot(
 
 
 # =========================================================
-# Evaluation
-# - report:
-#   (1) Undefended clean acc: model(images)
-#   (2) Undefended robust acc: model(x_adv)  (x_adv crafted vs chosen defense transform via cfg)
-#   (3) Defended clean/robust for each defense transform with majority vote
+# Evaluation (paper-style + fair baselines)
+# We report:
+#   - Undefended Clean Acc (single pass on clean)
+#   - Undefended Robust Acc (adaptive attack vs identity, evaluate single pass)
+# For each defense d:
+#   - Defended Clean Acc (majority vote on clean)
+#   - Defended Robust Acc (adaptive attack vs transform d using EOT, evaluate majority vote)
+# Also (optional debug):
+#   - Cross-eval Undef Robust on x_adv^(d): model(x_adv_d)
 # =========================================================
 @torch.no_grad()
-def eval_defenses_majority_vote(
+def eval_defenses_majority_vote_fair(
     name: str,
     ds,
     clip_model,
@@ -309,6 +320,7 @@ def eval_defenses_majority_vote(
     subset_seed: int = 0,
     K_vote_clean: int = 10,
     K_vote_adv: int = 10,
+    print_cross_eval: bool = True,
 ):
     print(
         f"\n===== {name} | Defenses={defenses} | Vote(K_clean={K_vote_clean},K_adv={K_vote_adv}) "
@@ -326,7 +338,12 @@ def eval_defenses_majority_vote(
     model = CLIPZeroShot(clip_model, text_features, device).to(device).eval().float()
 
     total = 0
+
+    # undefended clean
     undef_clean_correct = 0
+
+    # undefended robust under adaptive undef attack
+    undef_robust_correct_adaptive = 0
 
     # per-defense stats
     stats: Dict[str, Dict[str, float]] = {}
@@ -334,14 +351,12 @@ def eval_defenses_majority_vote(
         stats[d] = {
             "def_clean_correct": 0,
             "def_robust_correct": 0,
-            "asr_def_num": 0,     # among def-clean-correct, how many become wrong under defense after attack
+            "asr_def_num": 0,
             "def_clean_ok": 0,
+            # optional cross-eval
+            "undef_robust_cross_correct": 0,
+            "asr_undef_cross_num": 0,
         }
-
-    # optional: undef robust (but note: x_adv is crafted vs a chosen defense transform; we report per-defense undef robust as well)
-    undef_robust_correct_per_def: Dict[str, int] = {d: 0 for d in defenses}
-    asr_undef_num_per_def: Dict[str, int] = {d: 0 for d in defenses}
-    undef_clean_ok = 0
 
     for batch_idx, (images, labels) in enumerate(tqdm(loader, desc=f"{name}-eval", ncols=120)):
         images = images.to(device, non_blocking=True).float()
@@ -354,13 +369,22 @@ def eval_defenses_majority_vote(
         pred_uc = logits_uc.argmax(dim=1)
         uc = (pred_uc == labels)
         undef_clean_correct += uc.sum().item()
-        undef_clean_ok += uc.sum().item()
 
-        # For each defense, we:
-        #   (1) compute defended clean by majority vote
-        #   (2) craft x_adv against that defense via EOT on its transform
-        #   (3) measure undefended robust on that x_adv (for ASR_undef fairness per-defense)
-        #   (4) measure defended robust by majority vote
+        # ---------- Undefended adaptive attack + robust ----------
+        cfg_undef = replace(
+            attack_cfg_base,
+            seed=int(attack_cfg_base.seed) + int(batch_idx),
+            defense_transform_for_attacker="identity",
+            eot_M=1,
+        )
+        x_adv_undef = confident_square_attack_eot(model, images, labels, cfg_undef)
+
+        logits_ur_ad = model(x_adv_undef)
+        pred_ur_ad = logits_ur_ad.argmax(dim=1)
+        ur_ad = (pred_ur_ad == labels)
+        undef_robust_correct_adaptive += ur_ad.sum().item()
+
+        # ---------- Defenses ----------
         for d in defenses:
             # (1) defended clean
             pred_dc = predict_majority_vote(model, images, d, K=K_vote_clean)
@@ -368,23 +392,25 @@ def eval_defenses_majority_vote(
             stats[d]["def_clean_correct"] += dc.sum().item()
             stats[d]["def_clean_ok"] += dc.sum().item()
 
-            # (2) craft adversarial examples adaptive to this defense transform
-            cfg_b = replace(
+            # (2) craft adversarial examples adaptive to defense d
+            cfg_d = replace(
                 attack_cfg_base,
                 seed=int(attack_cfg_base.seed) + int(batch_idx),
-                defense_transform_for_attacker=d
+                defense_transform_for_attacker=d,
+                eot_M=int(attack_cfg_base.eot_M),
             )
-            x_adv = confident_square_attack_eot(model, images, labels, cfg_b)
+            x_adv_d = confident_square_attack_eot(model, images, labels, cfg_d)
 
-            # (3) undefended robust on x_adv (crafted vs defense d)
-            logits_ur = model(x_adv)
-            pred_ur = logits_ur.argmax(dim=1)
-            ur = (pred_ur == labels)
-            undef_robust_correct_per_def[d] += ur.sum().item()
-            asr_undef_num_per_def[d] += ((~ur) & uc).sum().item()
+            # (optional) cross-eval: undefended robust on x_adv_d
+            if print_cross_eval:
+                logits_ur_cross = model(x_adv_d)
+                pred_ur_cross = logits_ur_cross.argmax(dim=1)
+                ur_cross = (pred_ur_cross == labels)
+                stats[d]["undef_robust_cross_correct"] += ur_cross.sum().item()
+                stats[d]["asr_undef_cross_num"] += ((~ur_cross) & uc).sum().item()
 
-            # (4) defended robust on x_adv
-            pred_dr = predict_majority_vote(model, x_adv, d, K=K_vote_adv)
+            # (3) defended robust on x_adv_d
+            pred_dr = predict_majority_vote(model, x_adv_d, d, K=K_vote_adv)
             dr = (pred_dr == labels)
             stats[d]["def_robust_correct"] += dr.sum().item()
             stats[d]["asr_def_num"] += ((~dr) & dc).sum().item()
@@ -394,26 +420,28 @@ def eval_defenses_majority_vote(
 
     # ---------- print results ----------
     undef_clean_acc = undef_clean_correct / max(total, 1)
+    undef_robust_acc_ad = undef_robust_correct_adaptive / max(total, 1)
 
     print(f"\nRESULT: {name}")
-    print(f"Samples (subset):           {total}")
-    print(f"Undefended Clean Accuracy:  {undef_clean_acc:.4f}")
+    print(f"Samples (subset):                      {total}")
+    print(f"Undefended Clean Accuracy:             {undef_clean_acc:.4f}")
+    print(f"Undefended Robust Accuracy (adaptive): {undef_robust_acc_ad:.4f}   (attack vs identity, eval single-pass)")
 
     for d in defenses:
         def_clean_acc = stats[d]["def_clean_correct"] / max(total, 1)
         def_robust_acc = stats[d]["def_robust_correct"] / max(total, 1)
-
-        undef_robust_acc = undef_robust_correct_per_def[d] / max(total, 1)
-
         asr_def = stats[d]["asr_def_num"] / (stats[d]["def_clean_ok"] + 1e-12)
-        asr_undef = asr_undef_num_per_def[d] / (undef_clean_ok + 1e-12)
 
         print(f"\n--- Defense: {d} ---")
-        print(f"Defended  Clean Accuracy:   {def_clean_acc:.4f}  (MajorityVote K={K_vote_clean})")
-        print(f"Undefended Robust Accuracy: {undef_robust_acc:.4f}  (on x_adv crafted vs {d})")
-        print(f"Defended  Robust Accuracy:  {def_robust_acc:.4f}  (MajorityVote K={K_vote_adv} on x_adv crafted vs {d})")
-        print(f"ASR_def   (on def-clean-ok): {asr_def:.4f}")
-        print(f"ASR_undef (on undef-clean):  {asr_undef:.4f}")
+        print(f"Defended  Clean Accuracy:              {def_clean_acc:.4f}  (MajorityVote K={K_vote_clean})")
+        print(f"Defended  Robust Accuracy (adaptive):  {def_robust_acc:.4f}  (attack vs {d} with EOT-{attack_cfg_base.eot_M}, vote K={K_vote_adv})")
+        print(f"ASR_def (on def-clean-ok):             {asr_def:.4f}")
+
+        if print_cross_eval:
+            undef_robust_cross = stats[d]["undef_robust_cross_correct"] / max(total, 1)
+            asr_undef_cross = stats[d]["asr_undef_cross_num"] / (undef_clean_correct + 1e-12)
+            print(f"Undefended Robust (cross-eval):        {undef_robust_cross:.4f}  (eval single-pass on x_adv crafted vs {d})")
+            print(f"ASR_undef (cross-eval on undef-clean): {asr_undef_cross:.4f}")
 
     print("=" * 80 + "\n")
 
@@ -444,14 +472,15 @@ def main():
         "stl10": STL10(f"{DATA_ROOT}/stl10", split="test", download=True, transform=transform),
     }
 
+    # "paper-style": evaluate each transform defense separately
     defenses: Tuple[TransformType, ...] = ("crop_resize_80", "rotation_10")
 
-    # Attack config (low-budget; you can scale up later)
+    # Attack config (increase n_iters if you can afford; paper uses much larger budgets)
     attack_cfg = SquareAttackConfig(
         eps=8/255,
-        n_iters=500,
-        eot_M=10,
-        defense_transform_for_attacker="rotation_10",  # will be overridden per-defense
+        n_iters=500,     # try 2000 / 5000 if you can afford
+        eot_M=10,        # paper often uses 10 or 50
+        defense_transform_for_attacker="identity",  # will be overridden
         min_square=1,
         max_square=64,
         seed=0
@@ -461,16 +490,16 @@ def main():
     subset_size = 1000
     subset_seed = 0
 
-    # Voting K: in the paper they use 10 or 50 depending on EOT, but you can keep it small.
-    K_vote_clean = 10
-    K_vote_adv = 10
+    # paper-style: often set vote K equal to EOT M (10 or 50)
+    K_vote_clean = attack_cfg.eot_M
+    K_vote_adv = attack_cfg.eot_M
 
     for name, ds in datasets.items():
         print(f"\nPreparing: {name}")
         class_names = get_class_list(name, ds)
         text_features = build_text_features(class_names, clip_model, device)
 
-        eval_defenses_majority_vote(
+        eval_defenses_majority_vote_fair(
             name=name,
             ds=ds,
             clip_model=clip_model,
@@ -484,9 +513,9 @@ def main():
             subset_seed=subset_seed,
             K_vote_clean=K_vote_clean,
             K_vote_adv=K_vote_adv,
+            print_cross_eval=True,   # set False if you only want the fair metrics
         )
 
 
 if __name__ == "__main__":
     main()
-
