@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p gpu-short
 #SBATCH --nodes=1
-#SBATCH --exclusive
+
 #SBATCH --ntasks=1  
 #SBATCH --gres=gpu:1
 #SBATCH --mem=30G
