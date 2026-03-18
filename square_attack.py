@@ -2,7 +2,7 @@ import os
 import random
 import numpy as np
 from dataclasses import dataclass, replace
-from typing import Literal, Tuple, Dict
+from typing import Literal, Tuple, Dict, Optional
 
 from tqdm import tqdm
 
@@ -88,17 +88,26 @@ class CLIPZeroShot(nn.Module):
         self.register_buffer("mean", mean.to(device))
         self.register_buffer("std", std.to(device))
 
-    def forward(self, x):
-        x = (x - self.mean) / self.std
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def encode_image_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.preprocess(x)
         f = self.clip_model.encode_image(x)
         f = f / f.norm(dim=-1, keepdim=True)
-        logits = 100.0 * (f @ self.text_features.T)
-        return logits
+        return f
+
+    def logits_from_features(self, f: torch.Tensor) -> torch.Tensor:
+        return 100.0 * (f @ self.text_features.T)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f = self.encode_image_features(x)
+        return self.logits_from_features(f)
 
 
 # =========================================================
 # Randomized Transform Defense (inference-time)
-# identity: no transform (for fair "undefended adaptive" baseline attack)
+# identity: no transform
 # rotation_10: random angle in [-10,10]
 # crop_resize_80: random crop scale in [0.8, 1.0] then resize back
 # =========================================================
@@ -122,7 +131,6 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
 
         if t == "rotation_10":
             angle = random.uniform(-10.0, 10.0)
-            # IMPORTANT: fill=0 creates black corners which hurts CLIP; use per-image mean fill
             fill = float(xi.mean().item())
             xo = TF.rotate(
                 xi,
@@ -138,7 +146,7 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
             cw = max(1, int(round(W * scale)))
             top = random.randint(0, H - ch) if H > ch else 0
             left = random.randint(0, W - cw) if W > cw else 0
-            cropped = xi[:, top:top+ch, left:left+cw]
+            cropped = xi[:, top:top + ch, left:left + cw]
             xo = TF.resize(
                 cropped,
                 size=[H, W],
@@ -154,41 +162,76 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
 
 
 # =========================================================
-# Majority Vote Aggregation (paper-style)
-# - sample K transformed variants
-# - take argmax each time
-# - final pred is mode (ties broken by summed logits among tied classes)
+# Aggregation
 # =========================================================
+AggregationType = Literal["single", "vote", "avg_logits", "avg_features"]
+
+
 @torch.no_grad()
-def predict_majority_vote(
-    model: nn.Module,
+def predict_with_aggregation(
+    model: CLIPZeroShot,
     x: torch.Tensor,
     defense_t: TransformType,
+    aggregation: AggregationType,
     K: int = 10,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Returns:
-      pred_final: (B,)
+        pred_final:  (B,)
+        logits_final: (B,C)  surrogate/final logits used for reporting or attack
     """
+    if aggregation == "single" or defense_t == "identity" and K <= 1:
+        logits = model(x)
+        pred = logits.argmax(dim=1)
+        return pred, logits
+
     B = x.size(0)
 
-    # One forward to get number of classes (cheap, but keep it on same device)
-    num_classes = model(x[:1]).size(1)
-    votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.int32)
-    logits_sum = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32)
+    if aggregation == "vote":
+        num_classes = model(x[:1]).size(1)
+        votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.int32)
+        logits_sum = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32)
 
-    for _ in range(K):
-        xt = apply_random_transform_batch(x, defense_t)
-        logits = model(xt)  # (B,C)
-        pred = logits.argmax(dim=1)  # (B,)
-        votes.scatter_add_(1, pred.view(-1, 1), torch.ones((B, 1), device=x.device, dtype=torch.int32))
-        logits_sum += logits
+        for _ in range(K):
+            xt = apply_random_transform_batch(x, defense_t)
+            logits = model(xt)
+            pred = logits.argmax(dim=1)
+            votes.scatter_add_(1, pred.view(-1, 1), torch.ones((B, 1), device=x.device, dtype=torch.int32))
+            logits_sum += logits
 
-    max_votes = votes.max(dim=1, keepdim=True).values
-    tied = (votes == max_votes)
-    logits_tie = logits_sum.masked_fill(~tied, float("-inf"))
-    pred_final = logits_tie.argmax(dim=1)
-    return pred_final
+        max_votes = votes.max(dim=1, keepdim=True).values
+        tied = (votes == max_votes)
+        logits_tie = logits_sum.masked_fill(~tied, float("-inf"))
+        pred_final = logits_tie.argmax(dim=1)
+
+        # return averaged logits as a smooth surrogate too
+        logits_final = logits_sum / float(K)
+        return pred_final, logits_final
+
+    elif aggregation == "avg_logits":
+        logits_sum = None
+        for _ in range(K):
+            xt = apply_random_transform_batch(x, defense_t)
+            logits = model(xt)
+            logits_sum = logits if logits_sum is None else (logits_sum + logits)
+        logits_final = logits_sum / float(K)
+        pred_final = logits_final.argmax(dim=1)
+        return pred_final, logits_final
+
+    elif aggregation == "avg_features":
+        feat_sum = None
+        for _ in range(K):
+            xt = apply_random_transform_batch(x, defense_t)
+            f = model.encode_image_features(xt)
+            feat_sum = f if feat_sum is None else (feat_sum + f)
+        f_bar = feat_sum / float(K)
+        f_bar = f_bar / f_bar.norm(dim=-1, keepdim=True)
+        logits_final = model.logits_from_features(f_bar)
+        pred_final = logits_final.argmax(dim=1)
+        return pred_final, logits_final
+
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
 
 
 # =========================================================
@@ -204,37 +247,61 @@ def margin_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def eot_logits(
-    model: nn.Module,
+def eot_aggregated_logits(
+    model: CLIPZeroShot,
     x: torch.Tensor,
     t: TransformType,
     eot_M: int,
+    aggregation: AggregationType,
 ) -> torch.Tensor:
     """
-    Attacker EOT: average logits over M random transform instances.
-    For identity, M=1 is sufficient.
+    Attacker-side adaptive forward.
+    Returns logits used by the attacker.
+
+    For "vote", we use averaged logits as a smooth surrogate, while
+    evaluation still uses true majority vote.
     """
-    if t == "identity" or eot_M <= 1:
+    if aggregation == "single":
         return model(x)
 
-    acc = None
-    for _ in range(eot_M):
-        xt = apply_random_transform_batch(x, t)
-        logits = model(xt)
-        acc = logits if acc is None else (acc + logits)
-    return acc / float(eot_M)
+    if t == "identity":
+        return model(x)
+
+    if aggregation == "avg_logits" or aggregation == "vote":
+        logits_sum = None
+        M = max(1, eot_M)
+        for _ in range(M):
+            xt = apply_random_transform_batch(x, t)
+            logits = model(xt)
+            logits_sum = logits if logits_sum is None else (logits_sum + logits)
+        return logits_sum / float(M)
+
+    elif aggregation == "avg_features":
+        feat_sum = None
+        M = max(1, eot_M)
+        for _ in range(M):
+            xt = apply_random_transform_batch(x, t)
+            f = model.encode_image_features(xt)
+            feat_sum = f if feat_sum is None else (feat_sum + f)
+        f_bar = feat_sum / float(M)
+        f_bar = f_bar / f_bar.norm(dim=-1, keepdim=True)
+        return model.logits_from_features(f_bar)
+
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
 
 
 # =========================================================
-# Confident Square Attack (C-SQA) with EOT
+# Confident Square Attack (C-SQA) with adaptive EOT forward
 # - runs full N iterations (no early stop)
 # =========================================================
 @dataclass
 class SquareAttackConfig:
-    eps: float = 8/255
-    n_iters: int = 500
-    eot_M: int = 10
+    eps: float = 8 / 255
+    n_iters: int = 200
+    eot_M: int = 4
     defense_transform_for_attacker: TransformType = "identity"
+    aggregation_for_attacker: AggregationType = "single"
     min_square: int = 1
     max_square: int = 64
     seed: int = 0
@@ -249,24 +316,30 @@ def square_size_schedule(i: int, n_iters: int, H: int, W: int, min_s: int, max_s
 
 @torch.no_grad()
 def confident_square_attack_eot(
-    model: nn.Module,
+    model: CLIPZeroShot,
     x: torch.Tensor,
     y: torch.Tensor,
     cfg: SquareAttackConfig,
 ) -> torch.Tensor:
-    # make deterministic per call (pass different cfg.seed per batch)
+    # deterministic per call
     set_seed(cfg.seed)
 
     B, C, H, W = x.shape
     max_s = min(cfg.max_square, H, W)
 
-    # init: random sign noise within eps
+    # init random sign noise within eps
     x_adv = x + cfg.eps * torch.sign(torch.randn_like(x))
     x_adv = torch.max(torch.min(x_adv, x + cfg.eps), x - cfg.eps)
     x_adv = x_adv.clamp(0.0, 1.0)
 
-    logits0 = eot_logits(model, x_adv, cfg.defense_transform_for_attacker, cfg.eot_M)
-    best = margin_loss(logits0, y)  # (B,)
+    logits0 = eot_aggregated_logits(
+        model=model,
+        x=x_adv,
+        t=cfg.defense_transform_for_attacker,
+        eot_M=cfg.eot_M,
+        aggregation=cfg.aggregation_for_attacker,
+    )
+    best = margin_loss(logits0, y)
 
     for i in range(cfg.n_iters):
         s = square_size_schedule(i, cfg.n_iters, H, W, cfg.min_square, max_s)
@@ -277,13 +350,19 @@ def confident_square_attack_eot(
             left = random.randint(0, W - s) if W > s else 0
 
             patch_sign = 1.0 if random.random() < 0.5 else -1.0
-            patch = (x[b, :, top:top+s, left:left+s] + patch_sign * cfg.eps).clamp(0.0, 1.0)
-            x_new[b, :, top:top+s, left:left+s] = patch
+            patch = (x[b, :, top:top + s, left:left + s] + patch_sign * cfg.eps).clamp(0.0, 1.0)
+            x_new[b, :, top:top + s, left:left + s] = patch
 
         x_new = torch.max(torch.min(x_new, x + cfg.eps), x - cfg.eps)
         x_new = x_new.clamp(0.0, 1.0)
 
-        logits_new = eot_logits(model, x_new, cfg.defense_transform_for_attacker, cfg.eot_M)
+        logits_new = eot_aggregated_logits(
+            model=model,
+            x=x_new,
+            t=cfg.defense_transform_for_attacker,
+            eot_M=cfg.eot_M,
+            aggregation=cfg.aggregation_for_attacker,
+        )
         loss_new = margin_loss(logits_new, y)
 
         improved = loss_new < best
@@ -295,36 +374,37 @@ def confident_square_attack_eot(
 
 
 # =========================================================
-# Evaluation (paper-style + fair baselines)
+# Evaluation
 # We report:
 #   - Undefended Clean Acc (single pass on clean)
-#   - Undefended Robust Acc (adaptive attack vs identity, evaluate single pass)
-# For each defense d:
-#   - Defended Clean Acc (majority vote on clean)
-#   - Defended Robust Acc (adaptive attack vs transform d using EOT, evaluate majority vote)
-# Also (optional debug):
-#   - Cross-eval Undef Robust on x_adv^(d): model(x_adv_d)
+#   - Undefended Robust Acc (adaptive attack vs identity, eval single pass)
+# For each defense d and aggregation a:
+#   - Defended Clean Acc
+#   - Defended Robust Acc (adaptive attack matched to that defense)
 # =========================================================
 @torch.no_grad()
-def eval_defenses_majority_vote_fair(
+def eval_defenses_fair(
     name: str,
     ds,
     clip_model,
     device: str,
     text_features: torch.Tensor,
     defenses: Tuple[TransformType, ...],
+    aggregations: Tuple[AggregationType, ...],
     attack_cfg_base: SquareAttackConfig,
     batch_size: int = 32,
     num_workers: int = 4,
-    subset_size: int = 1000,
+    subset_size: int = 200,
     subset_seed: int = 0,
-    K_vote_clean: int = 10,
-    K_vote_adv: int = 10,
-    print_cross_eval: bool = True,
+    K_clean: int = 4,
+    K_adv: int = 4,
+    print_cross_eval: bool = False,
 ):
     print(
-        f"\n===== {name} | Defenses={defenses} | Vote(K_clean={K_vote_clean},K_adv={K_vote_adv}) "
-        f"| Attack=Conf-Square(EOT-{attack_cfg_base.eot_M}, iters={attack_cfg_base.n_iters}, eps={attack_cfg_base.eps}) | subset={subset_size} ====="
+        f"\n===== {name} | Defenses={defenses} | Aggregations={aggregations} "
+        f"| K_clean={K_clean} K_adv={K_adv} | "
+        f"Attack=Conf-Square(EOT-{attack_cfg_base.eot_M}, iters={attack_cfg_base.n_iters}, eps={attack_cfg_base.eps}) "
+        f"| subset={subset_size} ====="
     )
 
     loader = make_subset_loader(
@@ -339,24 +419,21 @@ def eval_defenses_majority_vote_fair(
 
     total = 0
 
-    # undefended clean
     undef_clean_correct = 0
-
-    # undefended robust under adaptive undef attack
     undef_robust_correct_adaptive = 0
 
-    # per-defense stats
     stats: Dict[str, Dict[str, float]] = {}
     for d in defenses:
-        stats[d] = {
-            "def_clean_correct": 0,
-            "def_robust_correct": 0,
-            "asr_def_num": 0,
-            "def_clean_ok": 0,
-            # optional cross-eval
-            "undef_robust_cross_correct": 0,
-            "asr_undef_cross_num": 0,
-        }
+        for a in aggregations:
+            key = f"{d}|{a}"
+            stats[key] = {
+                "def_clean_correct": 0,
+                "def_robust_correct": 0,
+                "asr_def_num": 0,
+                "def_clean_ok": 0,
+                "undef_robust_cross_correct": 0,
+                "asr_undef_cross_num": 0,
+            }
 
     for batch_idx, (images, labels) in enumerate(tqdm(loader, desc=f"{name}-eval", ncols=120)):
         images = images.to(device, non_blocking=True).float()
@@ -365,8 +442,13 @@ def eval_defenses_majority_vote_fair(
         total += n
 
         # ---------- Undefended clean ----------
-        logits_uc = model(images)
-        pred_uc = logits_uc.argmax(dim=1)
+        pred_uc, logits_uc = predict_with_aggregation(
+            model=model,
+            x=images,
+            defense_t="identity",
+            aggregation="single",
+            K=1,
+        )
         uc = (pred_uc == labels)
         undef_clean_correct += uc.sum().item()
 
@@ -375,45 +457,68 @@ def eval_defenses_majority_vote_fair(
             attack_cfg_base,
             seed=int(attack_cfg_base.seed) + int(batch_idx),
             defense_transform_for_attacker="identity",
+            aggregation_for_attacker="single",
             eot_M=1,
         )
         x_adv_undef = confident_square_attack_eot(model, images, labels, cfg_undef)
 
-        logits_ur_ad = model(x_adv_undef)
-        pred_ur_ad = logits_ur_ad.argmax(dim=1)
+        pred_ur_ad, _ = predict_with_aggregation(
+            model=model,
+            x=x_adv_undef,
+            defense_t="identity",
+            aggregation="single",
+            K=1,
+        )
         ur_ad = (pred_ur_ad == labels)
         undef_robust_correct_adaptive += ur_ad.sum().item()
 
-        # ---------- Defenses ----------
+        # ---------- Defenses x Aggregations ----------
         for d in defenses:
-            # (1) defended clean
-            pred_dc = predict_majority_vote(model, images, d, K=K_vote_clean)
-            dc = (pred_dc == labels)
-            stats[d]["def_clean_correct"] += dc.sum().item()
-            stats[d]["def_clean_ok"] += dc.sum().item()
+            for a in aggregations:
+                key = f"{d}|{a}"
 
-            # (2) craft adversarial examples adaptive to defense d
-            cfg_d = replace(
-                attack_cfg_base,
-                seed=int(attack_cfg_base.seed) + int(batch_idx),
-                defense_transform_for_attacker=d,
-                eot_M=int(attack_cfg_base.eot_M),
-            )
-            x_adv_d = confident_square_attack_eot(model, images, labels, cfg_d)
+                pred_dc, _ = predict_with_aggregation(
+                    model=model,
+                    x=images,
+                    defense_t=d,
+                    aggregation=a,
+                    K=K_clean,
+                )
+                dc = (pred_dc == labels)
+                stats[key]["def_clean_correct"] += dc.sum().item()
+                stats[key]["def_clean_ok"] += dc.sum().item()
 
-            # (optional) cross-eval: undefended robust on x_adv_d
-            if print_cross_eval:
-                logits_ur_cross = model(x_adv_d)
-                pred_ur_cross = logits_ur_cross.argmax(dim=1)
-                ur_cross = (pred_ur_cross == labels)
-                stats[d]["undef_robust_cross_correct"] += ur_cross.sum().item()
-                stats[d]["asr_undef_cross_num"] += ((~ur_cross) & uc).sum().item()
+                cfg_d = replace(
+                    attack_cfg_base,
+                    seed=int(attack_cfg_base.seed) + int(batch_idx),
+                    defense_transform_for_attacker=d,
+                    aggregation_for_attacker=a,
+                    eot_M=int(attack_cfg_base.eot_M),
+                )
+                x_adv_d = confident_square_attack_eot(model, images, labels, cfg_d)
 
-            # (3) defended robust on x_adv_d
-            pred_dr = predict_majority_vote(model, x_adv_d, d, K=K_vote_adv)
-            dr = (pred_dr == labels)
-            stats[d]["def_robust_correct"] += dr.sum().item()
-            stats[d]["asr_def_num"] += ((~dr) & dc).sum().item()
+                if print_cross_eval:
+                    pred_ur_cross, _ = predict_with_aggregation(
+                        model=model,
+                        x=x_adv_d,
+                        defense_t="identity",
+                        aggregation="single",
+                        K=1,
+                    )
+                    ur_cross = (pred_ur_cross == labels)
+                    stats[key]["undef_robust_cross_correct"] += ur_cross.sum().item()
+                    stats[key]["asr_undef_cross_num"] += ((~ur_cross) & uc).sum().item()
+
+                pred_dr, _ = predict_with_aggregation(
+                    model=model,
+                    x=x_adv_d,
+                    defense_t=d,
+                    aggregation=a,
+                    K=K_adv,
+                )
+                dr = (pred_dr == labels)
+                stats[key]["def_robust_correct"] += dr.sum().item()
+                stats[key]["asr_def_num"] += ((~dr) & dc).sum().item()
 
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -425,25 +530,27 @@ def eval_defenses_majority_vote_fair(
     print(f"\nRESULT: {name}")
     print(f"Samples (subset):                      {total}")
     print(f"Undefended Clean Accuracy:             {undef_clean_acc:.4f}")
-    print(f"Undefended Robust Accuracy (adaptive): {undef_robust_acc_ad:.4f}   (attack vs identity, eval single-pass)")
+    print(f"Undefended Robust Accuracy (adaptive): {undef_robust_acc_ad:.4f}")
 
     for d in defenses:
-        def_clean_acc = stats[d]["def_clean_correct"] / max(total, 1)
-        def_robust_acc = stats[d]["def_robust_correct"] / max(total, 1)
-        asr_def = stats[d]["asr_def_num"] / (stats[d]["def_clean_ok"] + 1e-12)
+        for a in aggregations:
+            key = f"{d}|{a}"
+            def_clean_acc = stats[key]["def_clean_correct"] / max(total, 1)
+            def_robust_acc = stats[key]["def_robust_correct"] / max(total, 1)
+            asr_def = stats[key]["asr_def_num"] / (stats[key]["def_clean_ok"] + 1e-12)
 
-        print(f"\n--- Defense: {d} ---")
-        print(f"Defended  Clean Accuracy:              {def_clean_acc:.4f}  (MajorityVote K={K_vote_clean})")
-        print(f"Defended  Robust Accuracy (adaptive):  {def_robust_acc:.4f}  (attack vs {d} with EOT-{attack_cfg_base.eot_M}, vote K={K_vote_adv})")
-        print(f"ASR_def (on def-clean-ok):             {asr_def:.4f}")
+            print(f"\n--- Defense: {d} | Aggregation: {a} ---")
+            print(f"Defended Clean Accuracy:              {def_clean_acc:.4f}")
+            print(f"Defended Robust Accuracy (adaptive):  {def_robust_acc:.4f}")
+            print(f"ASR_def (on def-clean-ok):            {asr_def:.4f}")
 
-        if print_cross_eval:
-            undef_robust_cross = stats[d]["undef_robust_cross_correct"] / max(total, 1)
-            asr_undef_cross = stats[d]["asr_undef_cross_num"] / (undef_clean_correct + 1e-12)
-            print(f"Undefended Robust (cross-eval):        {undef_robust_cross:.4f}  (eval single-pass on x_adv crafted vs {d})")
-            print(f"ASR_undef (cross-eval on undef-clean): {asr_undef_cross:.4f}")
+            if print_cross_eval:
+                undef_robust_cross = stats[key]["undef_robust_cross_correct"] / max(total, 1)
+                asr_undef_cross = stats[key]["asr_undef_cross_num"] / (undef_clean_correct + 1e-12)
+                print(f"Undefended Robust (cross-eval):       {undef_robust_cross:.4f}")
+                print(f"ASR_undef (cross-eval):               {asr_undef_cross:.4f}")
 
-    print("=" * 80 + "\n")
+    print("=" * 100 + "\n")
 
 
 # =========================================================
@@ -464,56 +571,64 @@ def main():
 
     DATA_ROOT = "data"
     datasets = {
+        # 建议先只开一个，省资源
         "cifar10": CIFAR10(f"{DATA_ROOT}/cifar10", train=False, download=True, transform=transform),
-        "cifar100": CIFAR100(f"{DATA_ROOT}/cifar100", train=False, download=True, transform=transform),
-        "food101": Food101(f"{DATA_ROOT}/food101", split="test", download=True, transform=transform),
-        "pets": OxfordIIITPet(f"{DATA_ROOT}/pets", split="test", download=True, transform=transform),
-        "fgvc_aircraft": FGVCAircraft(f"{DATA_ROOT}/fgvc_aircraft", split="test", download=True, transform=transform),
-        "stl10": STL10(f"{DATA_ROOT}/stl10", split="test", download=True, transform=transform),
+        # "cifar100": CIFAR100(f"{DATA_ROOT}/cifar100", train=False, download=True, transform=transform),
+        # "food101": Food101(f"{DATA_ROOT}/food101", split="test", download=True, transform=transform),
+        # "pets": OxfordIIITPet(f"{DATA_ROOT}/pets", split="test", download=True, transform=transform),
+        # "fgvc_aircraft": FGVCAircraft(f"{DATA_ROOT}/fgvc_aircraft", split="test", download=True, transform=transform),
+        # "stl10": STL10(f"{DATA_ROOT}/stl10", split="test", download=True, transform=transform),
     }
 
-    # "paper-style": evaluate each transform defense separately
     defenses: Tuple[TransformType, ...] = ("crop_resize_80", "rotation_10")
 
-    # Attack config (increase n_iters if you can afford; paper uses much larger budgets)
+    # 你最关心的比较对象
+    aggregations: Tuple[AggregationType, ...] = (
+        "vote",
+        "avg_logits",
+        "avg_features",
+    )
+
+    # 先用小预算看趋势
     attack_cfg = SquareAttackConfig(
-        eps=8/255,
-        n_iters=500,     # try 2000 / 5000 if you can afford
-        eot_M=10,        # paper often uses 10 or 50
-        defense_transform_for_attacker="identity",  # will be overridden
+        eps=8 / 255,
+        n_iters=200,     # 原来 500，先降一点
+        eot_M=4,         # 原来 10，先降一点
+        defense_transform_for_attacker="identity",
+        aggregation_for_attacker="single",
         min_square=1,
         max_square=64,
         seed=0
     )
 
     batch_size = 32
-    subset_size = 1000
+    subset_size = 200   # 原来 1000，先小跑
     subset_seed = 0
 
-    # paper-style: often set vote K equal to EOT M (10 or 50)
-    K_vote_clean = attack_cfg.eot_M
-    K_vote_adv = attack_cfg.eot_M
+    K_clean = 4         # 原来 10，先小跑
+    K_adv = 4
 
     for name, ds in datasets.items():
         print(f"\nPreparing: {name}")
         class_names = get_class_list(name, ds)
         text_features = build_text_features(class_names, clip_model, device)
 
-        eval_defenses_majority_vote_fair(
+        eval_defenses_fair(
             name=name,
             ds=ds,
             clip_model=clip_model,
             device=device,
             text_features=text_features,
             defenses=defenses,
+            aggregations=aggregations,
             attack_cfg_base=attack_cfg,
             batch_size=batch_size,
             num_workers=4,
             subset_size=subset_size,
             subset_seed=subset_seed,
-            K_vote_clean=K_vote_clean,
-            K_vote_adv=K_vote_adv,
-            print_cross_eval=True,   # set False if you only want the fair metrics
+            K_clean=K_clean,
+            K_adv=K_adv,
+            print_cross_eval=False,
         )
 
 
