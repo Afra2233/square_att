@@ -602,7 +602,7 @@ def main():
     )
 
     batch_size = 32
-    subset_size = 200   # 原来 1000，先小跑
+    subset_size = 1000   # 原来 1000，先小跑
     subset_seed = 0
 
     K_clean = 4         # 原来 10，先小跑
