@@ -176,7 +176,7 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
         return TF.gaussian_blur(xi, kernel_size=[kernel_size, kernel_size], sigma=sigma)
 
     def _rotate(xi: torch.Tensor, deg: float) -> torch.Tensor:
-       
+        # 和你原版保持一致：fill 用单张图平均像素
         fill = float(xi.mean())
         angle = random.uniform(-deg, deg)
         return TF.rotate(
@@ -1151,7 +1151,7 @@ def main():
 
     attack_cfg = SquareAttackConfig(
         eps=8 / 255, #每个像素最多只能改8/255
-        n_iters=100, #会迭代200次，即尝试 200 次修改，每次改一个方块，看有没有更好
+        n_iters=150, #会迭代200次，即尝试 200 次修改，每次改一个方块，看有没有更好
         eot_M=8, #eot做8次，每次forward做8次随机变换再平均
         defense_transform_for_attacker="identity",
         aggregation_for_attacker="single",
@@ -1162,7 +1162,7 @@ def main():
 
     batch_size = 16
     num_workers = 4
-    subset_size = 200
+    subset_size = 1000
     subset_seed = 0
 
     K_clean = 8 #Clean inference      → 用 K_clean 个 view
