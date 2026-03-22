@@ -324,7 +324,7 @@ def compute_semantic_logits_scores(
     #gather 就是按照 yhat_idx 指定的类别编号，从每个 view 里取对应那一列
     tmp = logits_bkc.clone() 
     tmp.scatter_(2, yhat_idx, float("-inf")) #把 ychat第一强那列全部改成 -∞
-    other_logit = tmp.max(dim=2).values3#现在没有最大的ychat了，最大的变成哥哥第二大的
+    other_logit = tmp.max(dim=2).values#现在没有最大的ychat了，最大的变成哥哥第二大的
     margin = true_logit - other_logit           # (B,K)
 
     # entropy (lower is better)
