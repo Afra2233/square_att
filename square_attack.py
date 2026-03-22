@@ -63,7 +63,7 @@ def make_subset_loader(
 # =========================================================
 # Build CLIP Text Features
 # =========================================================
-@torch.no_grad()
+@torch.inference_mode()
 def build_text_features(class_names, clip_model, device):
     prompts = [f"a photo of a {c.replace('_', ' ')}" for c in class_names]
     tokens = clip.tokenize(prompts).to(device)
@@ -118,76 +118,118 @@ TransformType = Literal[
     "gaussian_noise_light",
     "mixed_strong",
 ]
-
-@torch.no_grad()
+@torch.inference_mode()
 def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Tensor:
     """
     Apply one random transform instance per image in batch.
-    x: (B,3,H,W) in [0,1]
+    x: (B, 3, H, W) in [0, 1]
+    Returns: (B, 3, H, W)
     """
     if t == "identity":
         return x
 
-    B, C, H, W = x.shape
-    out = []
+    B, _, H, W = x.shape
 
+    # ---------- Fast batched branches ----------
+    if t == "horizontal_flip":
+        flip_mask = torch.rand(B, device=x.device) < 0.5
+        out = x.clone()
+        if flip_mask.any():
+            out[flip_mask] = torch.flip(out[flip_mask], dims=[3])
+        return out
+
+    if t == "gaussian_noise_light":
+        sigma = torch.empty(B, 1, 1, 1, device=x.device).uniform_(2.0 / 255.0, 6.0 / 255.0)
+        noise = torch.randn_like(x) * sigma
+        return (x + noise).clamp(0.0, 1.0)
+
+    # ---------- Helper for per-image ops ----------
+    def _crop_resize(xi: torch.Tensor, scale_min: float) -> torch.Tensor:
+        scale = random.uniform(scale_min, 1.0)
+        ch = max(1, int(round(H * scale)))
+        cw = max(1, int(round(W * scale)))
+        top = random.randint(0, H - ch) if H > ch else 0
+        left = random.randint(0, W - cw) if W > cw else 0
+        cropped = xi[:, top:top + ch, left:left + cw]
+        return TF.resize(
+            cropped,
+            size=[H, W],
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+
+    def _color_jitter_light(xi: torch.Tensor) -> torch.Tensor:
+        brightness = random.uniform(0.9, 1.1)
+        contrast = random.uniform(0.9, 1.1)
+        saturation = random.uniform(0.9, 1.1)
+        hue = random.uniform(-0.03, 0.03)
+
+        xo = TF.adjust_brightness(xi, brightness)
+        xo = TF.adjust_contrast(xo, contrast)
+        xo = TF.adjust_saturation(xo, saturation)
+        xo = TF.adjust_hue(xo, hue)
+        return xo
+
+    def _gaussian_blur_light(xi: torch.Tensor) -> torch.Tensor:
+        kernel_size = 3 if min(H, W) < 128 else 5
+        sigma = random.uniform(0.1, 1.0)
+        return TF.gaussian_blur(xi, kernel_size=[kernel_size, kernel_size], sigma=sigma)
+
+    def _rotate(xi: torch.Tensor, deg: float) -> torch.Tensor:
+       
+        fill = float(xi.mean())
+        angle = random.uniform(-deg, deg)
+        return TF.rotate(
+            xi,
+            angle=angle,
+            interpolation=InterpolationMode.BILINEAR,
+            expand=False,
+            fill=fill,
+        )
+
+    def _add_light_noise(xi: torch.Tensor) -> torch.Tensor:
+        sigma = random.uniform(2.0 / 255.0, 6.0 / 255.0)
+        noise = torch.randn_like(xi) * sigma
+        return xi + noise
+
+    def _apply_single(xi: torch.Tensor, op: str) -> torch.Tensor:
+        if op == "horizontal_flip":
+            return TF.hflip(xi) if random.random() < 0.5 else xi
+        elif op == "rotation_10":
+            return _rotate(xi, deg=10.0)
+        elif op == "rotation_8":
+            return _rotate(xi, deg=8.0)
+        elif op == "crop_resize_80":
+            return _crop_resize(xi, scale_min=0.8)
+        elif op == "crop_resize_85":
+            return _crop_resize(xi, scale_min=0.85)
+        elif op == "color_jitter_light":
+            return _color_jitter_light(xi)
+        elif op == "gaussian_blur_light":
+            return _gaussian_blur_light(xi)
+        elif op == "gaussian_noise_light":
+            return _add_light_noise(xi)
+        else:
+            raise ValueError(f"Unknown op: {op}")
+
+    # ---------- Per-image branches ----------
+    out = []
     for i in range(B):
         xi = x[i]
 
-        if t == "horizontal_flip":
-            if random.random() < 0.5:
-                xo = TF.hflip(xi)
-            else:
-                xo = xi
-        elif t == "rotation_10":
-            angle = random.uniform(-10.0, 10.0)
-            fill = float(xi.mean().item()) #因为图片旋转后，角落可能会空出来。这里不是填黑色 0，也不是填白色 1，而是：用这张图片的平均像素值来填充,这样通常会比纯黑边自然一些。
-            xo = TF.rotate(
-                xi,
-                angle=angle,
-                interpolation=InterpolationMode.BILINEAR, #双线性插值，旋转更平滑
-                expand=False,
-                fill=fill,
-            )
+        if t == "rotation_10":
+            xo = _apply_single(xi, "rotation_10")
 
         elif t == "crop_resize_80":
-            scale = random.uniform(0.8, 1.0)
-            ch = max(1, int(round(H * scale)))
-            cw = max(1, int(round(W * scale)))
-            top = random.randint(0, H - ch) if H > ch else 0 #随机选择裁剪位置
-            left = random.randint(0, W - cw) if W > cw else 0
-            cropped = xi[:, top:top + ch, left:left + cw]
-            xo = TF.resize(
-                cropped,
-                size=[H, W],
-                interpolation=InterpolationMode.BILINEAR,
-                antialias=True,
-            )
-        elif t == "color_jitter_light":
-            # 轻微亮度/对比度/饱和度变化，避免语义破坏过强
-            brightness = random.uniform(0.9, 1.1)
-            contrast = random.uniform(0.9, 1.1)
-            saturation = random.uniform(0.9, 1.1)
-            hue = random.uniform(-0.03, 0.03)
+            xo = _apply_single(xi, "crop_resize_80")
 
-            xo = TF.adjust_brightness(xi, brightness)
-            xo = TF.adjust_contrast(xo, contrast)
-            xo = TF.adjust_saturation(xo, saturation)
-            xo = TF.adjust_hue(xo, hue)
+        elif t == "color_jitter_light":
+            xo = _apply_single(xi, "color_jitter_light")
 
         elif t == "gaussian_blur_light":
-            # 轻模糊，破坏高频对抗扰动但不过度损伤语义
-            kernel_size = 3 if min(H, W) < 128 else 5
-            sigma = random.uniform(0.1, 1.0)
-            xo = TF.gaussian_blur(xi, kernel_size=[kernel_size, kernel_size], sigma=sigma)
-        elif t == "gaussian_noise_light":
-            # 小噪声，建议控制在很轻的范围
-            sigma = random.uniform(2.0 / 255.0, 6.0 / 255.0)
-            noise = torch.randn_like(xi) * sigma
-            xo = xi + noise
+            xo = _apply_single(xi, "gaussian_blur_light")
 
         elif t == "mixed_strong":
-            # 从一组温和增强里随机采样 1~2 个串联
             xo = xi
             ops = [
                 "horizontal_flip",
@@ -199,63 +241,153 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
             ]
             num_ops = random.choice([1, 2])
             chosen = random.sample(ops, k=num_ops)
-
             for op in chosen:
-                if op == "horizontal_flip":
-                    if random.random() < 0.5:
-                        xo = TF.hflip(xo)
-
-                elif op == "rotation_8":
-                    angle = random.uniform(-8.0, 8.0)
-                    fill = float(xo.mean().item())
-                    xo = TF.rotate(
-                        xo,
-                        angle=angle,
-                        interpolation=InterpolationMode.BILINEAR,
-                        expand=False,
-                        fill=fill,
-                    )
-
-                elif op == "crop_resize_85":
-                    scale = random.uniform(0.85, 1.0)
-                    ch = max(1, int(round(H * scale)))
-                    cw = max(1, int(round(W * scale)))
-                    top = random.randint(0, H - ch) if H > ch else 0
-                    left = random.randint(0, W - cw) if W > cw else 0
-                    cropped = xo[:, top:top + ch, left:left + cw]
-                    xo = TF.resize(
-                        cropped,
-                        size=[H, W],
-                        interpolation=InterpolationMode.BILINEAR,
-                        antialias=True,
-                    )
-
-                elif op == "color_jitter_light":
-                    brightness = random.uniform(0.9, 1.1)
-                    contrast = random.uniform(0.9, 1.1)
-                    saturation = random.uniform(0.9, 1.1)
-                    hue = random.uniform(-0.03, 0.03)
-                    xo = TF.adjust_brightness(xo, brightness)
-                    xo = TF.adjust_contrast(xo, contrast)
-                    xo = TF.adjust_saturation(xo, saturation)
-                    xo = TF.adjust_hue(xo, hue)
-
-                elif op == "gaussian_blur_light":
-                    kernel_size = 3 if min(H, W) < 128 else 5
-                    sigma = random.uniform(0.1, 1.0)
-                    xo = TF.gaussian_blur(xo, kernel_size=[kernel_size, kernel_size], sigma=sigma)
-
-                elif op == "gaussian_noise_light":
-                    sigma = random.uniform(2.0 / 255.0, 6.0 / 255.0)
-                    noise = torch.randn_like(xo) * sigma
-                    xo = xo + noise
+                xo = _apply_single(xo, op)
 
         else:
             raise ValueError(f"Unknown transform: {t}")
 
         out.append(xo.clamp(0.0, 1.0))
 
-    return torch.stack(out, dim=0) #(B, 3, H, W)
+    return torch.stack(out, dim=0)
+
+# @torch.inference_mode()
+# def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Tensor:
+#     """
+#     Apply one random transform instance per image in batch.
+#     x: (B,3,H,W) in [0,1]
+#     """
+#     if t == "identity":
+#         return x
+
+#     B, C, H, W = x.shape
+#     out = []
+
+#     for i in range(B):
+#         xi = x[i]
+
+#         if t == "horizontal_flip":
+#             if random.random() < 0.5:
+#                 xo = TF.hflip(xi)
+#             else:
+#                 xo = xi
+#         elif t == "rotation_10":
+#             angle = random.uniform(-10.0, 10.0)
+#             fill = float(xi.mean().item()) #因为图片旋转后，角落可能会空出来。这里不是填黑色 0，也不是填白色 1，而是：用这张图片的平均像素值来填充,这样通常会比纯黑边自然一些。
+#             xo = TF.rotate(
+#                 xi,
+#                 angle=angle,
+#                 interpolation=InterpolationMode.BILINEAR, #双线性插值，旋转更平滑
+#                 expand=False,
+#                 fill=fill,
+#             )
+
+#         elif t == "crop_resize_80":
+#             scale = random.uniform(0.8, 1.0)
+#             ch = max(1, int(round(H * scale)))
+#             cw = max(1, int(round(W * scale)))
+#             top = random.randint(0, H - ch) if H > ch else 0 #随机选择裁剪位置
+#             left = random.randint(0, W - cw) if W > cw else 0
+#             cropped = xi[:, top:top + ch, left:left + cw]
+#             xo = TF.resize(
+#                 cropped,
+#                 size=[H, W],
+#                 interpolation=InterpolationMode.BILINEAR,
+#                 antialias=True,
+#             )
+#         elif t == "color_jitter_light":
+#             # 轻微亮度/对比度/饱和度变化，避免语义破坏过强
+#             brightness = random.uniform(0.9, 1.1)
+#             contrast = random.uniform(0.9, 1.1)
+#             saturation = random.uniform(0.9, 1.1)
+#             hue = random.uniform(-0.03, 0.03)
+
+#             xo = TF.adjust_brightness(xi, brightness)
+#             xo = TF.adjust_contrast(xo, contrast)
+#             xo = TF.adjust_saturation(xo, saturation)
+#             xo = TF.adjust_hue(xo, hue)
+
+#         elif t == "gaussian_blur_light":
+#             # 轻模糊，破坏高频对抗扰动但不过度损伤语义
+#             kernel_size = 3 if min(H, W) < 128 else 5
+#             sigma = random.uniform(0.1, 1.0)
+#             xo = TF.gaussian_blur(xi, kernel_size=[kernel_size, kernel_size], sigma=sigma)
+#         elif t == "gaussian_noise_light":
+#             # 小噪声，建议控制在很轻的范围
+#             sigma = random.uniform(2.0 / 255.0, 6.0 / 255.0)
+#             noise = torch.randn_like(xi) * sigma
+#             xo = xi + noise
+
+#         elif t == "mixed_strong":
+#             # 从一组温和增强里随机采样 1~2 个串联
+#             xo = xi
+#             ops = [
+#                 "horizontal_flip",
+#                 "rotation_8",
+#                 "crop_resize_85",
+#                 "color_jitter_light",
+#                 "gaussian_blur_light",
+#                 "gaussian_noise_light",
+#             ]
+#             num_ops = random.choice([1, 2])
+#             chosen = random.sample(ops, k=num_ops)
+
+#             for op in chosen:
+#                 if op == "horizontal_flip":
+#                     if random.random() < 0.5:
+#                         xo = TF.hflip(xo)
+
+#                 elif op == "rotation_8":
+#                     angle = random.uniform(-8.0, 8.0)
+#                     fill = float(xo.mean().item())
+#                     xo = TF.rotate(
+#                         xo,
+#                         angle=angle,
+#                         interpolation=InterpolationMode.BILINEAR,
+#                         expand=False,
+#                         fill=fill,
+#                     )
+
+#                 elif op == "crop_resize_85":
+#                     scale = random.uniform(0.85, 1.0)
+#                     ch = max(1, int(round(H * scale)))
+#                     cw = max(1, int(round(W * scale)))
+#                     top = random.randint(0, H - ch) if H > ch else 0
+#                     left = random.randint(0, W - cw) if W > cw else 0
+#                     cropped = xo[:, top:top + ch, left:left + cw]
+#                     xo = TF.resize(
+#                         cropped,
+#                         size=[H, W],
+#                         interpolation=InterpolationMode.BILINEAR,
+#                         antialias=True,
+#                     )
+
+#                 elif op == "color_jitter_light":
+#                     brightness = random.uniform(0.9, 1.1)
+#                     contrast = random.uniform(0.9, 1.1)
+#                     saturation = random.uniform(0.9, 1.1)
+#                     hue = random.uniform(-0.03, 0.03)
+#                     xo = TF.adjust_brightness(xo, brightness)
+#                     xo = TF.adjust_contrast(xo, contrast)
+#                     xo = TF.adjust_saturation(xo, saturation)
+#                     xo = TF.adjust_hue(xo, hue)
+
+#                 elif op == "gaussian_blur_light":
+#                     kernel_size = 3 if min(H, W) < 128 else 5
+#                     sigma = random.uniform(0.1, 1.0)
+#                     xo = TF.gaussian_blur(xo, kernel_size=[kernel_size, kernel_size], sigma=sigma)
+
+#                 elif op == "gaussian_noise_light":
+#                     sigma = random.uniform(2.0 / 255.0, 6.0 / 255.0)
+#                     noise = torch.randn_like(xo) * sigma
+#                     xo = xo + noise
+
+#         else:
+#             raise ValueError(f"Unknown transform: {t}")
+
+#         out.append(xo.clamp(0.0, 1.0))
+
+#     return torch.stack(out, dim=0) #(B, 3, H, W)
 
 
 # =========================================================
@@ -271,7 +403,7 @@ AggregationType = Literal[
 ]
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def collect_view_logits_and_features(
     model: CLIPZeroShot,
     x: torch.Tensor,
@@ -297,7 +429,7 @@ def collect_view_logits_and_features(
     return feats, logits
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_semantic_logits_scores(
     logits_bkc: torch.Tensor,
     beta_entropy: float = 0.5,
@@ -336,7 +468,7 @@ def compute_semantic_logits_scores(
     return scores_bk, yhat, conf0
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def predict_with_aggregation(
     model: CLIPZeroShot,
     x: torch.Tensor,
@@ -361,7 +493,8 @@ def predict_with_aggregation(
     B = x.size(0)
 
     if aggregation == "vote": #vote对异常值不敏感，logits会被异常值影响，先vote，如果vote一样在看logits
-        num_classes = model(x[:1]).size(1)
+        #num_classes = model(x[:1]).size(1)
+        num_classes = model.text_features.size(0)
         votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.int32) #(B, num_classes)
         logits_sum = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32) #(B, num_classes)
 
@@ -450,7 +583,7 @@ def predict_with_aggregation(
 # =========================================================
 # Mechanism metrics: view consistency & image-text alignment stability
 # =========================================================
-@torch.no_grad()
+@torch.inference_mode()
 def collect_view_features(
     model: CLIPZeroShot,
     x: torch.Tensor,
@@ -469,7 +602,7 @@ def collect_view_features(
     return torch.stack(feats, dim=1)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_view_consistency(feats_bkd: torch.Tensor) -> torch.Tensor:
     """
     feats_bkd: (B, K, D), normalized
@@ -488,7 +621,7 @@ def compute_view_consistency(feats_bkd: torch.Tensor) -> torch.Tensor:
     return consistency
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_alignment_stats(
     feats_bkd: torch.Tensor,
     labels: torch.Tensor,
@@ -509,7 +642,7 @@ def compute_alignment_stats(
     return sims.mean(dim=1), sims.var(dim=1, unbiased=False)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def compute_mechanism_metrics(
     model: CLIPZeroShot,
     x: torch.Tensor,
@@ -545,7 +678,7 @@ def margin_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def eot_aggregated_logits(
+def eot_aggregated_logits(#给定一个输入 x，按照防御的 transform + aggregation 方式，计算“攻击者认为的最终 logits”。
     model: CLIPZeroShot,
     x: torch.Tensor,
     t: TransformType,
@@ -646,10 +779,16 @@ def confident_square_attack_eot(
     B, C, H, W = x.shape
     max_s = min(cfg.max_square, H, W)
 
-    x_adv = x + cfg.eps * torch.sign(torch.randn_like(x))
+    x_adv = x + cfg.eps * torch.sign(torch.randn_like(x)) #对每个像素加一个随机符号的扰动
+    #torch.randn_like(x) : 生成一个和 x 形状一样的随机张量,[[ 0.3, -1.2],[ 2.1, -0.5]]
+    #torch.sign(...) :把它变成 ±1 的符号矩阵,比如[ +1, -1],[ +1, -1]]
+    #cfg.eps = 8/255 ≈ 0.031,乘以 cfg.eps = [[ +0.031, -0.031],[ +0.031, -0.031]],加到原图上去
     x_adv = torch.max(torch.min(x_adv, x + cfg.eps), x - cfg.eps)
+    #torch.min(x_adv, x + eps):如果某个像素超过 x + eps，就截断到 x + eps
+    #torch.max(..., x - eps):如果某个像素低于 x - eps，就抬高到 x - eps
     x_adv = x_adv.clamp(0.0, 1.0)
-
+    #保证像素合法（0~1
+    
     logits0 = eot_aggregated_logits(
         model=model,
         x=x_adv,
@@ -657,23 +796,26 @@ def confident_square_attack_eot(
         eot_M=cfg.eot_M,
         aggregation=cfg.aggregation_for_attacker,
     )
-    best = margin_loss(logits0, y)
+    best = margin_loss(logits0, y)# 这意味攻击很成功，最牛的错误分类和正确分类区别很小。如果best<0意味着已经错误分类了。
 
-    for i in range(cfg.n_iters):
+    for i in range(cfg.n_iters):#总共做 cfg.n_iters 轮尝试每轮都生成一个新的候选对抗样本 x_new,看它比当前 x_adv 好不好
         s = square_size_schedule(i, cfg.n_iters, H, W, cfg.min_square, max_s)
-
+        #每一轮先决定这次改多大的方块
         x_new = x_adv.clone()
         for b in range(B):
             top = random.randint(0, H - s) if H > s else 0
             left = random.randint(0, W - s) if W > s else 0
-
+            #在图片里随机找一个 s × s 的区域，top 是这个方块左上角的行坐标，left 是列坐标
             patch_sign = 1.0 if random.random() < 0.5 else -1.0
+            #随机决定这块加 +eps 还是 -eps,50% 概率选 +eps,50% 概率选 -eps
             patch = (x[b, :, top:top + s, left:left + s] + patch_sign * cfg.eps).clamp(0.0, 1.0)
+            #取原图中的这个区域，然后整块都加上 eps 或减去 eps
             x_new[b, :, top:top + s, left:left + s] = patch
+            #把这块写回候选图
 
         x_new = torch.max(torch.min(x_new, x + cfg.eps), x - cfg.eps)
         x_new = x_new.clamp(0.0, 1.0)
-
+        #确保合法
         logits_new = eot_aggregated_logits(
             model=model,
             x=x_new,
@@ -690,11 +832,30 @@ def confident_square_attack_eot(
 
     return x_adv
 
+@torch.inference_mode()
+def forward_logits_and_features(model: CLIPZeroShot, x: torch.Tensor):
+    feats = model.encode_image_features(x)       # (B, D)
+    logits = model.logits_from_features(feats)   # (B, C)
+    return logits, feats
 
+@torch.inference_mode()
+def mechanism_from_single_view_features(
+    feats_bd: torch.Tensor,
+    labels: torch.Tensor,
+    text_features: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    correct_text = text_features[labels]               # (B, D)
+    sims = (feats_bd * correct_text).sum(dim=-1)       # (B,)
+    B = feats_bd.size(0)
+    return {
+        "view_consistency": torch.ones(B, device=feats_bd.device),
+        "align_mean": sims,
+        "align_var": torch.zeros(B, device=feats_bd.device),
+    }
 # =========================================================
 # Evaluation
 # =========================================================
-@torch.no_grad()
+@torch.inference_mode()
 def eval_defenses_fair_with_mechanism(
     name: str,
     ds,
@@ -765,24 +926,35 @@ def eval_defenses_fair_with_mechanism(
         n = labels.numel()
         total += n
 
-        # ---------- Undefended clean ----------
-        pred_uc, _ = predict_with_aggregation(
-            model=model,
-            x=images,
-            defense_t="identity",
-            aggregation="single",
-            K=1,
-        )
+        # # ---------- Undefended clean ----------
+        # pred_uc, _ = predict_with_aggregation(
+        #     model=model,
+        #     x=images,
+        #     defense_t="identity",
+        #     aggregation="single",
+        #     K=1,
+        # )
+        # uc = (pred_uc == labels)
+        # undef_clean_correct += uc.sum().item()
+
+        # mech_clean_id = compute_mechanism_metrics(
+        #     model=model,
+        #     x=images,
+        #     labels=labels,
+        #     defense_t="identity",
+        #     K=1,
+        # )
+        logits_uc, feats_uc = forward_logits_and_features(model, images)
+        pred_uc = logits_uc.argmax(dim=1)
         uc = (pred_uc == labels)
         undef_clean_correct += uc.sum().item()
 
-        mech_clean_id = compute_mechanism_metrics(
-            model=model,
-            x=images,
+        mech_clean_id = mechanism_from_single_view_features(
+            feats_bd=feats_uc,
             labels=labels,
-            defense_t="identity",
-            K=1,
+            text_features=model.text_features,
         )
+
         mech_stats["clean_identity_view_consistency_sum"] += mech_clean_id["view_consistency"].sum().item()
         mech_stats["clean_identity_align_mean_sum"] += mech_clean_id["align_mean"].sum().item()
         mech_stats["clean_identity_align_var_sum"] += mech_clean_id["align_var"].sum().item()
@@ -797,28 +969,37 @@ def eval_defenses_fair_with_mechanism(
         )
         x_adv_undef = confident_square_attack_eot(model, images, labels, cfg_undef)
 
-        pred_ur_ad, _ = predict_with_aggregation(
-            model=model,
-            x=x_adv_undef,
-            defense_t="identity",
-            aggregation="single",
-            K=1,
-        )
+        # pred_ur_ad, _ = predict_with_aggregation(
+        #     model=model,
+        #     x=x_adv_undef,
+        #     defense_t="identity",
+        #     aggregation="single",
+        #     K=1,
+        # )
+        # ur_ad = (pred_ur_ad == labels)
+        # undef_robust_correct_adaptive += ur_ad.sum().item()
+
+        # mech_adv_id = compute_mechanism_metrics(
+        #     model=model,
+        #     x=x_adv_undef,
+        #     labels=labels,
+        #     defense_t="identity",
+        #     K=1,
+        # )
+        logits_ur_ad, feats_ur_ad = forward_logits_and_features(model, x_adv_undef)
+        pred_ur_ad = logits_ur_ad.argmax(dim=1)
         ur_ad = (pred_ur_ad == labels)
         undef_robust_correct_adaptive += ur_ad.sum().item()
 
-        mech_adv_id = compute_mechanism_metrics(
-            model=model,
-            x=x_adv_undef,
+        mech_adv_id = mechanism_from_single_view_features(
+            feats_bd=feats_ur_ad,
             labels=labels,
-            defense_t="identity",
-            K=1,
+            text_features=model.text_features,
         )
         mech_stats["adv_identity_view_consistency_sum"] += mech_adv_id["view_consistency"].sum().item()
         mech_stats["adv_identity_align_mean_sum"] += mech_adv_id["align_mean"].sum().item()
         mech_stats["adv_identity_align_var_sum"] += mech_adv_id["align_var"].sum().item()
-
-        # ---------- Defenses x Aggregations ----------
+                # ---------- Defenses x Aggregations ----------
         for d in defenses:
             mech_clean = compute_mechanism_metrics(
                 model=model,
@@ -970,7 +1151,7 @@ def main():
 
     attack_cfg = SquareAttackConfig(
         eps=8 / 255, #每个像素最多只能改8/255
-        n_iters=200, #会迭代200次，即尝试 200 次修改，每次改一个方块，看有没有更好
+        n_iters=100, #会迭代200次，即尝试 200 次修改，每次改一个方块，看有没有更好
         eot_M=8, #eot做8次，每次forward做8次随机变换再平均
         defense_transform_for_attacker="identity",
         aggregation_for_attacker="single",
@@ -980,8 +1161,8 @@ def main():
     )
 
     batch_size = 16
-    num_workers = 0
-    subset_size = 300
+    num_workers = 4
+    subset_size = 200
     subset_seed = 0
 
     K_clean = 8 #Clean inference      → 用 K_clean 个 view
