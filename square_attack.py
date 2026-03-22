@@ -944,7 +944,7 @@ def main():
     datasets = {
         "cifar10": CIFAR10(f"{DATA_ROOT}/cifar10", train=False, download=True, transform=transform),
         # "cifar100": CIFAR100(f"{DATA_ROOT}/cifar100", train=False, download=True, transform=transform),
-        # "food101": Food101(f"{DATA_ROOT}/food101", split="test", download=True, transform=transform),
+        "food101": Food101(f"{DATA_ROOT}/food101", split="test", download=True, transform=transform),
         # "pets": OxfordIIITPet(f"{DATA_ROOT}/pets", split="test", download=True, transform=transform),
         # "fgvc_aircraft": FGVCAircraft(f"{DATA_ROOT}/fgvc_aircraft", split="test", download=True, transform=transform),
         # "stl10": STL10(f"{DATA_ROOT}/stl10", split="test", download=True, transform=transform),
