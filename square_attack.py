@@ -107,8 +107,17 @@ class CLIPZeroShot(nn.Module):
 # =========================================================
 # Randomized Transform Defense (inference-time)
 # =========================================================
-TransformType = Literal["identity", "rotation_10", "crop_resize_80"]
-
+#TransformType = Literal["identity", "rotation_10", "crop_resize_80"] #Literal[]变量只能取固定几个value，这里指只能取"identity", "rotation_10", "crop_resize_80"
+TransformType = Literal[
+    "identity",
+    "horizontal_flip",
+    "rotation_10",
+    "crop_resize_80",
+    "color_jitter_light",
+    "gaussian_blur_light",
+    "gaussian_noise_light",
+    "mixed_strong",
+]
 
 @torch.no_grad()
 def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Tensor:
@@ -125,13 +134,18 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
     for i in range(B):
         xi = x[i]
 
-        if t == "rotation_10":
+        if t == "horizontal_flip":
+            if random.random() < 0.5:
+                xo = TF.hflip(xi)
+            else:
+                xo = xi
+        elif t == "rotation_10":
             angle = random.uniform(-10.0, 10.0)
-            fill = float(xi.mean().item())
+            fill = float(xi.mean().item()) #因为图片旋转后，角落可能会空出来。这里不是填黑色 0，也不是填白色 1，而是：用这张图片的平均像素值来填充,这样通常会比纯黑边自然一些。
             xo = TF.rotate(
                 xi,
                 angle=angle,
-                interpolation=InterpolationMode.BILINEAR,
+                interpolation=InterpolationMode.BILINEAR, #双线性插值，旋转更平滑
                 expand=False,
                 fill=fill,
             )
@@ -140,7 +154,7 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
             scale = random.uniform(0.8, 1.0)
             ch = max(1, int(round(H * scale)))
             cw = max(1, int(round(W * scale)))
-            top = random.randint(0, H - ch) if H > ch else 0
+            top = random.randint(0, H - ch) if H > ch else 0 #随机选择裁剪位置
             left = random.randint(0, W - cw) if W > cw else 0
             cropped = xi[:, top:top + ch, left:left + cw]
             xo = TF.resize(
@@ -149,12 +163,99 @@ def apply_random_transform_batch(x: torch.Tensor, t: TransformType) -> torch.Ten
                 interpolation=InterpolationMode.BILINEAR,
                 antialias=True,
             )
+        elif t == "color_jitter_light":
+            # 轻微亮度/对比度/饱和度变化，避免语义破坏过强
+            brightness = random.uniform(0.9, 1.1)
+            contrast = random.uniform(0.9, 1.1)
+            saturation = random.uniform(0.9, 1.1)
+            hue = random.uniform(-0.03, 0.03)
+
+            xo = TF.adjust_brightness(xi, brightness)
+            xo = TF.adjust_contrast(xo, contrast)
+            xo = TF.adjust_saturation(xo, saturation)
+            xo = TF.adjust_hue(xo, hue)
+
+        elif t == "gaussian_blur_light":
+            # 轻模糊，破坏高频对抗扰动但不过度损伤语义
+            kernel_size = 3 if min(H, W) < 128 else 5
+            sigma = random.uniform(0.1, 1.0)
+            xo = TF.gaussian_blur(xi, kernel_size=[kernel_size, kernel_size], sigma=sigma)
+        elif t == "gaussian_noise_light":
+            # 小噪声，建议控制在很轻的范围
+            sigma = random.uniform(2.0 / 255.0, 6.0 / 255.0)
+            noise = torch.randn_like(xi) * sigma
+            xo = xi + noise
+
+        elif t == "mixed_strong":
+            # 从一组温和增强里随机采样 1~2 个串联
+            xo = xi
+            ops = [
+                "horizontal_flip",
+                "rotation_8",
+                "crop_resize_85",
+                "color_jitter_light",
+                "gaussian_blur_light",
+                "gaussian_noise_light",
+            ]
+            num_ops = random.choice([1, 2])
+            chosen = random.sample(ops, k=num_ops)
+
+            for op in chosen:
+                if op == "horizontal_flip":
+                    if random.random() < 0.5:
+                        xo = TF.hflip(xo)
+
+                elif op == "rotation_8":
+                    angle = random.uniform(-8.0, 8.0)
+                    fill = float(xo.mean().item())
+                    xo = TF.rotate(
+                        xo,
+                        angle=angle,
+                        interpolation=InterpolationMode.BILINEAR,
+                        expand=False,
+                        fill=fill,
+                    )
+
+                elif op == "crop_resize_85":
+                    scale = random.uniform(0.85, 1.0)
+                    ch = max(1, int(round(H * scale)))
+                    cw = max(1, int(round(W * scale)))
+                    top = random.randint(0, H - ch) if H > ch else 0
+                    left = random.randint(0, W - cw) if W > cw else 0
+                    cropped = xo[:, top:top + ch, left:left + cw]
+                    xo = TF.resize(
+                        cropped,
+                        size=[H, W],
+                        interpolation=InterpolationMode.BILINEAR,
+                        antialias=True,
+                    )
+
+                elif op == "color_jitter_light":
+                    brightness = random.uniform(0.9, 1.1)
+                    contrast = random.uniform(0.9, 1.1)
+                    saturation = random.uniform(0.9, 1.1)
+                    hue = random.uniform(-0.03, 0.03)
+                    xo = TF.adjust_brightness(xo, brightness)
+                    xo = TF.adjust_contrast(xo, contrast)
+                    xo = TF.adjust_saturation(xo, saturation)
+                    xo = TF.adjust_hue(xo, hue)
+
+                elif op == "gaussian_blur_light":
+                    kernel_size = 3 if min(H, W) < 128 else 5
+                    sigma = random.uniform(0.1, 1.0)
+                    xo = TF.gaussian_blur(xo, kernel_size=[kernel_size, kernel_size], sigma=sigma)
+
+                elif op == "gaussian_noise_light":
+                    sigma = random.uniform(2.0 / 255.0, 6.0 / 255.0)
+                    noise = torch.randn_like(xo) * sigma
+                    xo = xo + noise
+
         else:
             raise ValueError(f"Unknown transform: {t}")
 
         out.append(xo.clamp(0.0, 1.0))
 
-    return torch.stack(out, dim=0)
+    return torch.stack(out, dim=0) #(B, 3, H, W)
 
 
 # =========================================================
@@ -212,18 +313,18 @@ def compute_semantic_logits_scores(
     B, K, C = logits_bkc.shape
 
     # first-pass pseudo-label from average logits
-    logits0 = logits_bkc.mean(dim=1)            # (B,C)
+    logits0 = logits_bkc.mean(dim=1)            # (B,C)，对 K 个 view 的 logits 取平均
     probs0 = logits0.softmax(dim=-1)
-    yhat = logits0.argmax(dim=1)                # (B,)
-    conf0 = probs0.max(dim=1).values            # (B,)
+    yhat = logits0.argmax(dim=1)                # (B,)得到一个“初步预测类别”
+    conf0 = probs0.max(dim=1).values            # (B,)得到这个预测的置信度，整体来看，这张图我有多自信”
 
     # margin wrt pseudo-label
-    yhat_idx = yhat.view(B, 1, 1).expand(-1, K, 1)   # (B,K,1)
-    true_logit = logits_bkc.gather(dim=2, index=yhat_idx).squeeze(-1)  # (B,K)
-
-    tmp = logits_bkc.clone()
-    tmp.scatter_(2, yhat_idx, float("-inf"))
-    other_logit = tmp.max(dim=2).values
+    yhat_idx = yhat.view(B, 1, 1).expand(-1, K, 1)  
+    true_logit = logits_bkc.gather(dim=2, index=yhat_idx).squeeze(-1)  # (B,K) # 已经知道yhat是多少了，然后true_logits从logits_bkc中拿出所有那个类的logits，比如true_logit = [5, 4, 6]
+    #gather 就是按照 yhat_idx 指定的类别编号，从每个 view 里取对应那一列
+    tmp = logits_bkc.clone() 
+    tmp.scatter_(2, yhat_idx, float("-inf")) #把 ychat第一强那列全部改成 -∞
+    other_logit = tmp.max(dim=2).values3#现在没有最大的ychat了，最大的变成哥哥第二大的
     margin = true_logit - other_logit           # (B,K)
 
     # entropy (lower is better)
@@ -259,10 +360,10 @@ def predict_with_aggregation(
 
     B = x.size(0)
 
-    if aggregation == "vote":
+    if aggregation == "vote": #vote对异常值不敏感，logits会被异常值影响，先vote，如果vote一样在看logits
         num_classes = model(x[:1]).size(1)
-        votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.int32)
-        logits_sum = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32)
+        votes = torch.zeros((B, num_classes), device=x.device, dtype=torch.int32) #(B, num_classes)
+        logits_sum = torch.zeros((B, num_classes), device=x.device, dtype=torch.float32) #(B, num_classes)
 
         for _ in range(K):
             xt = apply_random_transform_batch(x, defense_t)
@@ -289,7 +390,7 @@ def predict_with_aggregation(
         pred_final = logits_final.argmax(dim=1)
         return pred_final, logits_final
 
-    elif aggregation == "avg_features":
+    elif aggregation == "avg_features": #先把 K 次的“图像特征”平均 → 再做分类
         feat_sum = None
         for _ in range(K):
             xt = apply_random_transform_batch(x, defense_t)
@@ -301,7 +402,7 @@ def predict_with_aggregation(
         pred_final = logits_final.argmax(dim=1)
         return pred_final, logits_final
 
-    elif aggregation == "semantic_weighted_logits":
+    elif aggregation == "semantic_weighted_logits":#所有 view 都用，但加权
         _, logits_bkc = collect_view_logits_and_features(model, x, defense_t, K)
         scores_bk, _, conf0 = compute_semantic_logits_scores(
             logits_bkc=logits_bkc,
@@ -313,13 +414,13 @@ def predict_with_aggregation(
 
         # fallback to avg_logits if first-pass confidence too low
         logits_avg = logits_bkc.mean(dim=1)
-        use_weighted = (conf0 >= conf_gate).float().view(-1, 1)
+        use_weighted = (conf0 >= conf_gate).float().view(-1, 1) #use_weighted =0 或 1
         logits_final = use_weighted * logits_weighted + (1.0 - use_weighted) * logits_avg
 
         pred_final = logits_final.argmax(dim=1)
         return pred_final, logits_final
 
-    elif aggregation == "semantic_topk_logits":
+    elif aggregation == "semantic_topk_logits": #只用最好的 K 个 view，其它直接丢掉
         _, logits_bkc = collect_view_logits_and_features(model, x, defense_t, K)
         scores_bk, _, conf0 = compute_semantic_logits_scores(
             logits_bkc=logits_bkc,
@@ -329,14 +430,14 @@ def predict_with_aggregation(
         k_keep = max(1, int(round(K * topk_ratio)))
         topk_idx = scores_bk.topk(k_keep, dim=1).indices  # (B,k_keep)
 
-        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, logits_bkc.size(-1))
+        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, logits_bkc.size(-1)) #把topk个 view 的 logits 取出来
         logits_topk = logits_bkc.gather(dim=1, index=gather_idx)  # (B,k_keep,C)
 
         logits_topk_mean = logits_topk.mean(dim=1)  # (B,C)
         logits_avg = logits_bkc.mean(dim=1)
 
         # fallback to avg_logits if first-pass confidence too low
-        use_topk = (conf0 >= conf_gate).float().view(-1, 1)
+        use_topk = (conf0 >= conf_gate).float().view(-1, 1) 
         logits_final = use_topk * logits_topk_mean + (1.0 - use_topk) * logits_avg
 
         pred_final = logits_final.argmax(dim=1)
@@ -827,7 +928,7 @@ def eval_defenses_fair_with_mechanism(
 # Main
 # =========================================================
 def main():
-    set_seed(0)
+    set_seed(0) #随机数固定
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[DEBUG] Device: {device}")
 
@@ -850,8 +951,13 @@ def main():
     }
 
     defenses: Tuple[TransformType, ...] = (
+        "horizontal_flip",
         "crop_resize_80",
         "rotation_10",
+        "color_jitter_light",
+        "gaussian_blur_light",
+        "gaussian_noise_light",
+        "mixed_strong",
     )
 
     aggregations: Tuple[AggregationType, ...] = (
@@ -863,9 +969,9 @@ def main():
     )
 
     attack_cfg = SquareAttackConfig(
-        eps=8 / 255,
-        n_iters=200,
-        eot_M=8,
+        eps=8 / 255, #每个像素最多只能改8/255
+        n_iters=200, #会迭代200次，即尝试 200 次修改，每次改一个方块，看有没有更好
+        eot_M=8, #eot做8次，每次forward做8次随机变换再平均
         defense_transform_for_attacker="identity",
         aggregation_for_attacker="single",
         min_square=1,
@@ -875,12 +981,13 @@ def main():
 
     batch_size = 16
     num_workers = 0
-    subset_size = 1000
+    subset_size = 300
     subset_seed = 0
 
-    K_clean = 8
-    K_adv = 8
-    K_mech = 8
+    K_clean = 8 #Clean inference      → 用 K_clean 个 view
+    K_adv = 8 #Adversarial inference → 用 K_adv 个 view
+    K_mech = 8 #Mechanism分析         → 用 K_mech 个 view
+    
 
     for name, ds in datasets.items():
         print(f"\nPreparing: {name}")
