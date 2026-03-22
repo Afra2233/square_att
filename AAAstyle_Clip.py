@@ -769,7 +769,7 @@ def main():
 
     attack_cfg = SquareAttackConfig(
         eps=8 / 255,
-        n_iters=100,
+        n_iters=200,
         eot_M=1,      # deterministic defense
         min_square=1,
         max_square=64,
@@ -778,7 +778,7 @@ def main():
 
     batch_size = 16
     num_workers = 4
-    subset_size = 200
+    subset_size = 1000
     subset_seed = 0
 
     for name, ds in datasets.items():
