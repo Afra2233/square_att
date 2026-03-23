@@ -716,7 +716,7 @@ def margin_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 @dataclass
 class SquareAttackConfig:
     eps: float = 8 / 255
-    n_iters: int = 200
+    n_iters: int = 200 #对每张图都进行200次patch生成，每次iter里都包含m个eot，最后200次后输出结果为那张图片的最终x_adv
     eot_M: int = 8
     min_square: int = 1
     max_square: int = 64
@@ -1001,9 +1001,15 @@ def main():
     os.makedirs(DATA_ROOT, exist_ok=True)
 
     datasets = {
-        "cifar10": CIFAR10(
-            root=f"{DATA_ROOT}/cifar10",
-            train=False,
+        # "cifar10": CIFAR10(
+        #     root=f"{DATA_ROOT}/cifar10",
+        #     train=False,
+        #     download=True,
+        #     transform=transform,
+        # ),
+        "food101": Food101(
+            root=f"{DATA_ROOT}/food101",
+            split="test",
             download=True,
             transform=transform,
         ),
@@ -1013,12 +1019,7 @@ def main():
             download=True,
             transform=transform,
         ),
-        "food101": Food101(
-            root=f"{DATA_ROOT}/food101",
-            split="test",
-            download=True,
-            transform=transform,
-        ),
+       
         "stl10": STL10(
             root=f"{DATA_ROOT}/stl10",
             split="test",
@@ -1029,8 +1030,8 @@ def main():
 
     attack_cfg = SquareAttackConfig(
         eps=8 / 255,
-        n_iters=50,
-        eot_M=8,
+        n_iters=200,
+        eot_M=16,
         min_square=1,
         max_square=64,
         seed=0,
@@ -1127,6 +1128,36 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+# accepted_step_ratio
+
+# 被接受的更新比例
+# 越高说明攻击更容易找到有效方向
+
+# mean_accepted_improvement
+
+# 每次成功更新平均带来多大 loss 改善
+
+# margin_trend_std
+
+# margin 变化的波动程度
+
+# margin_sign_flip_ratio
+
+# 相邻 step 的改善方向是否频繁翻转
+# 越高可能说明防御导致攻击优化更不稳定
+
+# avg_score_shift_l1
+
+# 防御 shaping 前后输出分布变化量
+
+# avg_cross_view_std
+
+# 不同视图预测差异
+
+# final_margin_mean
+
+# 攻击结束时的平均 margin
 
 
 # import os
