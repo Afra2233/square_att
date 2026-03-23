@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
-from torchvision.datasets import CIFAR10, Food101
+from torchvision.datasets import CIFAR10, CIFAR100, Food101, STL10
 
 import clip
 
@@ -30,9 +30,17 @@ def set_seed(seed: int = 0):
 
 
 def get_class_list(name, ds):
-    if hasattr(ds, "classes"):
+    if hasattr(ds, "classes") and ds.classes is not None:
         return ds.classes
-    raise RuntimeError(f"[FATAL] Dataset {name} has no .classes; please provide class names.")
+
+    name = name.lower()
+    if name == "stl10":
+        return [
+            "airplane", "bird", "car", "cat", "deer",
+            "dog", "horse", "monkey", "ship", "truck"
+        ]
+
+    raise RuntimeError(f"[FATAL] Dataset {name} has no usable class names.")
 
 
 def make_subset_loader(
@@ -75,6 +83,13 @@ def build_text_features(class_names, clip_model, device, dataset_name: str):
             "a photo of a plate of {}",
             "a close-up photo of {}",
             "a photo of cooked {}",
+        ]
+    elif dname == "stl10":
+        templates = [
+            "a photo of a {}",
+            "a good photo of a {}",
+            "a close-up photo of a {}",
+            "a blurry photo of a {}",
         ]
     else:
         templates = [
@@ -443,10 +458,9 @@ def defended_predict(
 
 # =========================================================
 # Fast attacker-side forward with EOT
-# Key optimization:
 # - deterministic views: cache views once, EOT only repeats shaping
 # - stochastic views: rerun full pipeline each EOT sample
-# EOT includes random shaping.
+# EOT includes random shaping
 # =========================================================
 @torch.no_grad()
 def defended_forward_for_attacker(
@@ -466,10 +480,6 @@ def defended_forward_for_attacker(
     score_shift_sum = None
     cross_view_std_sum = None
 
-    # -----------------------------------------------------
-    # Case 1: no multiview
-    # EOT only repeats shaping
-    # -----------------------------------------------------
     if not use_multiview:
         base_logits = model(x)
         base_cross_view_std = torch.zeros(x.size(0), device=x.device)
@@ -492,10 +502,6 @@ def defended_forward_for_attacker(
         }
         return logits_sum / float(M), out_aux
 
-    # -----------------------------------------------------
-    # Case 2: multiview + deterministic views
-    # cache views once, EOT only repeats shaping
-    # -----------------------------------------------------
     if deterministic_views:
         feats_bkd, logits_bkc = collect_view_logits_and_features(model, x, view_list)
         base_logits, base_cross_view_std = aggregate_from_view_cache(model, feats_bkd, logits_bkc, agg_type)
@@ -518,10 +524,6 @@ def defended_forward_for_attacker(
         }
         return logits_sum / float(M), out_aux
 
-    # -----------------------------------------------------
-    # Case 3: multiview + stochastic views
-    # rerun full defense each EOT sample
-    # -----------------------------------------------------
     for _ in range(M):
         _, logits, aux = defended_predict(
             model=model,
@@ -560,8 +562,8 @@ def margin_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 @dataclass
 class SquareAttackConfig:
     eps: float = 8 / 255
-    n_iters: int = 50
-    eot_M: int = 4
+    n_iters: int = 200
+    eot_M: int = 8
     min_square: int = 1
     max_square: int = 64
     seed: int = 0
@@ -685,6 +687,7 @@ def square_attack_with_logging(
 
 # =========================================================
 # Eval
+# B: final clean/robust accuracy also use EOT-averaged defended accuracy
 # =========================================================
 @torch.inference_mode()
 def eval_defense_family(
@@ -697,15 +700,16 @@ def eval_defense_family(
     attack_cfg: SquareAttackConfig,
     view_mode: ViewMode,
     strong_views: bool = True,
-    batch_size: int = 4,
+    batch_size: int = 8,
     num_workers: int = 4,
-    subset_size: int = 50,
+    subset_size: int = 100,
     subset_seed: int = 0,
 ):
     view_list = get_view_list(view_mode=view_mode, strong=strong_views)
 
     print(f"\n===== {name} | subset={subset_size} | attack=adaptive square | view_mode={view_mode} =====")
     print(f"Views: {view_list}")
+    print(f"Final clean/robust accuracy: EOT-averaged defended accuracy")
     print(f"EOT includes random shaping: YES")
 
     loader = make_subset_loader(
@@ -743,7 +747,7 @@ def eval_defense_family(
         total += labels.numel()
 
         for dcfg in defense_list:
-            pred_clean, _, _ = defended_predict(
+            clean_logits_eval, _ = defended_forward_for_attacker(
                 model=model,
                 x=images,
                 use_multiview=dcfg.use_multiview,
@@ -751,7 +755,9 @@ def eval_defense_family(
                 view_list=view_list,
                 use_random_shaping=dcfg.use_random_shaping,
                 shaping_family=list(dcfg.shaping_family),
+                eot_M=attack_cfg.eot_M,
             )
+            pred_clean = clean_logits_eval.argmax(dim=1)
             clean_ok = (pred_clean == labels)
             stats[dcfg.name]["clean_correct"] += clean_ok.sum().item()
             stats[dcfg.name]["clean_ok_count"] += clean_ok.sum().item()
@@ -767,7 +773,7 @@ def eval_defense_family(
                 view_list=view_list,
             )
 
-            pred_adv, _, _ = defended_predict(
+            adv_logits_eval, _ = defended_forward_for_attacker(
                 model=model,
                 x=x_adv,
                 use_multiview=dcfg.use_multiview,
@@ -775,7 +781,9 @@ def eval_defense_family(
                 view_list=view_list,
                 use_random_shaping=dcfg.use_random_shaping,
                 shaping_family=list(dcfg.shaping_family),
+                eot_M=attack_cfg.eot_M,
             )
+            pred_adv = adv_logits_eval.argmax(dim=1)
             adv_ok = (pred_adv == labels)
             stats[dcfg.name]["robust_correct"] += adv_ok.sum().item()
             stats[dcfg.name]["asr_num"] += ((~adv_ok) & clean_ok).sum().item()
@@ -846,18 +854,30 @@ def main():
             download=True,
             transform=transform,
         ),
-        # "food101": Food101(
-        #     root=f"{DATA_ROOT}/food101",
-        #     split="test",
-        #     download=True,
-        #     transform=transform,
-        # ),
+        "cifar100": CIFAR100(
+            root=f"{DATA_ROOT}/cifar100",
+            train=False,
+            download=True,
+            transform=transform,
+        ),
+        "food101": Food101(
+            root=f"{DATA_ROOT}/food101",
+            split="test",
+            download=True,
+            transform=transform,
+        ),
+        "stl10": STL10(
+            root=f"{DATA_ROOT}/stl10",
+            split="test",
+            download=True,
+            transform=transform,
+        ),
     }
 
     attack_cfg = SquareAttackConfig(
         eps=8 / 255,
-        n_iters=50,   # 先小一点，确认趋势
-        eot_M=4,      # 加速版建议先 4
+        n_iters=50,
+        eot_M=8,
         min_square=1,
         max_square=64,
         seed=0,
@@ -894,9 +914,9 @@ def main():
         ),
     ]
 
-    batch_size = 64
-    num_workers = 8
-    subset_size = 100
+    batch_size = 8
+    num_workers = 4
+    subset_size = 500
     subset_seed = 0
 
     for name, ds in datasets.items():
@@ -904,7 +924,6 @@ def main():
         class_names = get_class_list(name, ds)
         text_features = build_text_features(class_names, clip_model, device, dataset_name=name)
 
-        # 版本 1: deterministic views
         eval_defense_family(
             name=name,
             ds=ds,
@@ -921,7 +940,6 @@ def main():
             subset_seed=subset_seed,
         )
 
-        # 版本 2: stochastic views
         eval_defense_family(
             name=name,
             ds=ds,
