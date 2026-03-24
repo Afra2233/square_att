@@ -742,7 +742,7 @@ def eval_defense_family(
     strong_views: bool = True,
     batch_size: int = 8,
     num_workers: int = 4,
-    subset_size: int = 1000,
+    subset_size: int = 200,
     subset_seed: int = 0,
 ):
     view_list = get_view_list(view_mode=view_mode, strong=strong_views)
@@ -983,7 +983,7 @@ def main():
 
     batch_size = 64
     num_workers = 4
-    subset_size = 1000
+    subset_size = 200
     subset_seed = 0
 
     for name, ds in datasets.items():
