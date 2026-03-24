@@ -1,5 +1,6 @@
 import os
 import random
+import math
 import numpy as np
 from dataclasses import dataclass, replace
 from typing import Literal, Tuple, Dict, List, Optional
@@ -8,6 +9,7 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from torchvision import transforms
@@ -131,6 +133,13 @@ ShapingType = Literal[
     "hybrid_margin_target",
 ]
 
+PostprocessType = Literal[
+    "none",
+    "random_shape",
+    "aaa_linear",
+    "aaa_sine",
+]
+
 
 @torch.inference_mode()
 def target_margin_soft_threshold(
@@ -138,10 +147,6 @@ def target_margin_soft_threshold(
     gamma: float = 3.0,
     alpha: float = 0.7,
 ) -> torch.Tensor:
-    """
-    m* = m + alpha * max(0, gamma - m)
-    If margin is below gamma, move it partially toward gamma.
-    """
     return margin + alpha * torch.clamp(gamma - margin, min=0.0)
 
 
@@ -151,10 +156,6 @@ def target_margin_hybrid(
     gamma: float = 3.0,
     rho: float = 1.5,
 ) -> torch.Tensor:
-    """
-    m* = max(rho * m, gamma)
-    Enforce either relative amplification or a minimum safe margin.
-    """
     return torch.maximum(rho * margin, torch.full_like(margin, gamma))
 
 
@@ -226,15 +227,115 @@ def sample_random_shaping(
 
 
 # =========================================================
-# Unified defended prediction (single-view only)
+# AAA (Adversarial Attack on Attackers)
+# =========================================================
+@dataclass
+class AAAConfig:
+    temperature: float = 1.0   # paper里通常要单独调；这里默认 1.0 方便直接跑
+    tau: float = 6.0
+    beta: float = 5.0
+    kappa: int = 100
+    lr: float = 0.1
+    alpha_linear: float = 1.0
+    alpha_sine: float = 0.7
+
+
+def margin_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    true = logits.gather(1, y.view(-1, 1)).squeeze(1)
+    tmp = logits.clone()
+    tmp.scatter_(1, y.view(-1, 1), -1e9)
+    other = tmp.max(dim=1).values
+    return true - other
+
+
+def aaa_target_loss(
+    lorg: torch.Tensor,
+    mode: Literal["aaa_linear", "aaa_sine"],
+    tau: float,
+    alpha: float,
+) -> torch.Tensor:
+    # latr = (floor(lorg / tau) + 1/2) * tau
+    latr = (torch.floor(lorg / tau) + 0.5) * tau
+
+    if mode == "aaa_linear":
+        # ltrg_lnr = latr - alpha * (lorg - latr)
+        ltrg = latr - alpha * (lorg - latr)
+    elif mode == "aaa_sine":
+        # ltrg_sin = lorg - alpha * tau * sin(pi * (1 - 2(lorg - latr)/tau))
+        ltrg = lorg - alpha * tau * torch.sin(
+            math.pi * (1.0 - 2.0 * (lorg - latr) / tau)
+        )
+    else:
+        raise ValueError(f"Unsupported AAA mode: {mode}")
+
+    return ltrg
+
+
+def aaa_postprocess_logits(
+    logits_org: torch.Tensor,
+    y: torch.Tensor,
+    mode: Literal["aaa_linear", "aaa_sine"],
+    aaa_cfg: AAAConfig,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Optimize logits z:
+        min || Lu(z) - ltrg ||_1 + beta * || sigma(z) - ptrg ||_1
+
+    where:
+        Lu(z)     = untargeted margin loss for ground-truth y
+        sigma(z)  = max softmax probability
+        ptrg      = sigma(zorg / T)
+    """
+    device = logits_org.device
+    B, C = logits_org.shape
+
+    with torch.no_grad():
+        lorg = margin_loss(logits_org, y)  # [B]
+        alpha = aaa_cfg.alpha_linear if mode == "aaa_linear" else aaa_cfg.alpha_sine
+        ltrg = aaa_target_loss(
+            lorg=lorg,
+            mode=mode,
+            tau=aaa_cfg.tau,
+            alpha=alpha,
+        )
+
+        ptrg = F.softmax(logits_org / aaa_cfg.temperature, dim=-1).max(dim=1).values
+
+    z = logits_org.detach().clone().requires_grad_(True)
+    optimizer = torch.optim.Adam([z], lr=aaa_cfg.lr, betas=(0.9, 0.999))
+
+    for _ in range(aaa_cfg.kappa):
+        optimizer.zero_grad()
+
+        lz = margin_loss(z, y)
+        pz = F.softmax(z, dim=-1).max(dim=1).values
+
+        loss = (lz - ltrg).abs().mean() + aaa_cfg.beta * (pz - ptrg).abs().mean()
+        loss.backward()
+        optimizer.step()
+
+    z_final = z.detach()
+
+    aux = {
+        "score_shift_l1": (F.softmax(z_final, dim=-1) - F.softmax(logits_org, dim=-1)).abs().sum(dim=1),
+        "cross_view_std": torch.zeros(B, device=device),
+    }
+    return z_final, aux
+
+
+# =========================================================
+# Unified defended prediction
 # =========================================================
 @torch.inference_mode()
 def defended_predict(
     model: CLIPZeroShot,
     x: torch.Tensor,
-    use_random_shaping: bool,
+    y: torch.Tensor,
+    postprocess_type: PostprocessType,
+    use_random_shaping: bool = False,
     shaping_family: Optional[List[ShapingType]] = None,
     shaping_topk: int = 2,
+    aaa_cfg: Optional[AAAConfig] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     aux = {}
 
@@ -242,42 +343,65 @@ def defended_predict(
     logits = model.logits_from_features(feats)
     aux["cross_view_std"] = torch.zeros(x.size(0), device=x.device)
 
-    shaping = sample_random_shaping(use_random_shaping, shaping_family)
-    logits_before_shape = logits.clone()
+    logits_before = logits.clone()
 
-    logits = random_shape_logits(
-        logits=logits,
-        shaping=shaping,
-        shaping_topk=shaping_topk,
-    )
+    if postprocess_type == "none":
+        pass
 
-    shaping_id_map = {
-        "none": 0,
-        "soft_threshold_target": 1,
-        "hybrid_margin_target": 2,
-    }
-    aux["shaping_id"] = torch.full(
-        (x.size(0),), shaping_id_map[shaping], device=x.device, dtype=torch.long
-    )
+    elif postprocess_type == "random_shape":
+        shaping = sample_random_shaping(use_random_shaping, shaping_family)
+        logits = random_shape_logits(
+            logits=logits,
+            shaping=shaping,
+            shaping_topk=shaping_topk,
+        )
 
-    probs_before = logits_before_shape.softmax(dim=-1)
-    probs_after = logits.softmax(dim=-1)
-    aux["score_shift_l1"] = (probs_after - probs_before).abs().sum(dim=1)
+        shaping_id_map = {
+            "none": 0,
+            "soft_threshold_target": 1,
+            "hybrid_margin_target": 2,
+        }
+        aux["shaping_id"] = torch.full(
+            (x.size(0),), shaping_id_map[shaping], device=x.device, dtype=torch.long
+        )
+
+    elif postprocess_type in {"aaa_linear", "aaa_sine"}:
+        assert aaa_cfg is not None
+        # AAA 需要优化 logits，因此这里临时打开 grad
+        with torch.enable_grad():
+            logits, aaa_aux = aaa_postprocess_logits(
+                logits_org=logits.detach(),
+                y=y,
+                mode=postprocess_type,
+                aaa_cfg=aaa_cfg,
+            )
+        aux["score_shift_l1"] = aaa_aux["score_shift_l1"]
+        aux["cross_view_std"] = aaa_aux["cross_view_std"]
+
+    else:
+        raise ValueError(f"Unsupported postprocess_type: {postprocess_type}")
+
+    if "score_shift_l1" not in aux:
+        probs_before = logits_before.softmax(dim=-1)
+        probs_after = logits.softmax(dim=-1)
+        aux["score_shift_l1"] = (probs_after - probs_before).abs().sum(dim=1)
 
     pred = logits.argmax(dim=1)
     return pred, logits, aux
 
 
 # =========================================================
-# Fast attacker-side forward with EOT (single-view only)
+# Fast attacker-side forward with EOT
 # =========================================================
-@torch.no_grad()
 def defended_forward_for_attacker(
     model: CLIPZeroShot,
     x: torch.Tensor,
-    use_random_shaping: bool,
-    shaping_family: Optional[List[ShapingType]],
+    y: torch.Tensor,
+    postprocess_type: PostprocessType,
+    use_random_shaping: bool = False,
+    shaping_family: Optional[List[ShapingType]] = None,
     shaping_topk: int = 2,
+    aaa_cfg: Optional[AAAConfig] = None,
     eot_M: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     M = max(1, eot_M)
@@ -286,17 +410,33 @@ def defended_forward_for_attacker(
     score_shift_sum = None
     cross_view_std_sum = None
 
-    base_logits = model(x)
+    with torch.no_grad():
+        base_logits = model(x)
     base_cross_view_std = torch.zeros(x.size(0), device=x.device)
 
-    for _ in range(M):
-        shaping = sample_random_shaping(use_random_shaping, shaping_family)
+    if postprocess_type in {"aaa_linear", "aaa_sine"}:
+        # AAA 是确定性的，不需要 EOT 多次重复
+        with torch.enable_grad():
+            out_logits, out_aux = aaa_postprocess_logits(
+                logits_org=base_logits.detach(),
+                y=y,
+                mode=postprocess_type,
+                aaa_cfg=aaa_cfg,
+            )
+        return out_logits.detach(), out_aux
 
-        shaped_logits = random_shape_logits(
-            base_logits,
-            shaping=shaping,
-            shaping_topk=shaping_topk,
-        )
+    for _ in range(M):
+        if postprocess_type == "none":
+            shaped_logits = base_logits
+        elif postprocess_type == "random_shape":
+            shaping = sample_random_shaping(use_random_shaping, shaping_family)
+            shaped_logits = random_shape_logits(
+                base_logits,
+                shaping=shaping,
+                shaping_topk=shaping_topk,
+            )
+        else:
+            raise ValueError(f"Unsupported postprocess_type: {postprocess_type}")
 
         probs_before = base_logits.softmax(dim=-1)
         probs_after = shaped_logits.softmax(dim=-1)
@@ -311,17 +451,6 @@ def defended_forward_for_attacker(
         "cross_view_std": cross_view_std_sum / float(M),
     }
     return logits_sum / float(M), out_aux
-
-
-# =========================================================
-# Loss
-# =========================================================
-def margin_loss(logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    true = logits.gather(1, y.view(-1, 1)).squeeze(1)
-    tmp = logits.clone()
-    tmp.scatter_(1, y.view(-1, 1), -1e9)
-    other = tmp.max(dim=1).values
-    return true - other
 
 
 # =========================================================
@@ -340,9 +469,11 @@ class SquareAttackConfig:
 @dataclass
 class DefenseConfig:
     name: str
-    use_random_shaping: bool
-    shaping_family: Tuple[ShapingType, ...]
+    postprocess_type: PostprocessType
+    use_random_shaping: bool = False
+    shaping_family: Tuple[ShapingType, ...] = ("none",)
     shaping_topk: int = 2
+    aaa_cfg: Optional[AAAConfig] = None
 
 
 def square_size_schedule(i: int, n_iters: int, H: int, W: int, min_s: int, max_s: int) -> int:
@@ -372,9 +503,12 @@ def square_attack_with_logging(
     logits0, aux0 = defended_forward_for_attacker(
         model=model,
         x=x_adv,
+        y=y,
+        postprocess_type=defense_cfg.postprocess_type,
         use_random_shaping=defense_cfg.use_random_shaping,
         shaping_family=list(defense_cfg.shaping_family),
         shaping_topk=defense_cfg.shaping_topk,
+        aaa_cfg=defense_cfg.aaa_cfg,
         eot_M=attack_cfg.eot_M,
     )
     best = margin_loss(logits0, y)
@@ -406,9 +540,12 @@ def square_attack_with_logging(
         logits_new, aux_new = defended_forward_for_attacker(
             model=model,
             x=x_new,
+            y=y,
+            postprocess_type=defense_cfg.postprocess_type,
             use_random_shaping=defense_cfg.use_random_shaping,
             shaping_family=list(defense_cfg.shaping_family),
             shaping_topk=defense_cfg.shaping_topk,
+            aaa_cfg=defense_cfg.aaa_cfg,
             eot_M=attack_cfg.eot_M,
         )
         loss_new = margin_loss(logits_new, y)
@@ -466,7 +603,7 @@ def eval_defense_family(
 ):
     print(f"\n===== {name} | subset={subset_size} | attack=adaptive square | single-view only =====")
     print("Final clean/robust accuracy: EOT-averaged defended accuracy")
-    print("EOT includes random shaping: YES")
+    print("EOT includes random shaping for random_shape, AAA is deterministic")
 
     loader = make_subset_loader(
         ds=ds,
@@ -506,9 +643,12 @@ def eval_defense_family(
             clean_logits_eval, _ = defended_forward_for_attacker(
                 model=model,
                 x=images,
+                y=labels,
+                postprocess_type=dcfg.postprocess_type,
                 use_random_shaping=dcfg.use_random_shaping,
                 shaping_family=list(dcfg.shaping_family),
                 shaping_topk=dcfg.shaping_topk,
+                aaa_cfg=dcfg.aaa_cfg,
                 eot_M=attack_cfg.eot_M,
             )
 
@@ -530,9 +670,12 @@ def eval_defense_family(
             adv_logits_eval, _ = defended_forward_for_attacker(
                 model=model,
                 x=x_adv,
+                y=labels,
+                postprocess_type=dcfg.postprocess_type,
                 use_random_shaping=dcfg.use_random_shaping,
                 shaping_family=list(dcfg.shaping_family),
                 shaping_topk=dcfg.shaping_topk,
+                aaa_cfg=dcfg.aaa_cfg,
                 eot_M=attack_cfg.eot_M,
             )
             pred_adv = adv_logits_eval.argmax(dim=1)
@@ -565,7 +708,7 @@ def eval_defense_family(
         asr = val["asr_num"] / (val["clean_ok_count"] + 1e-12)
         nb = max(val["num_batches"], 1.0)
 
-        print(f"\n--- {dcfg.name} (shaping_topk={dcfg.shaping_topk}) ---")
+        print(f"\n--- {dcfg.name} ---")
         print(f"Clean Acc:                 {clean_acc:.4f}")
         print(f"Robust Acc:                {robust_acc:.4f}")
         print(f"ASR(clean-correct):        {asr:.4f}")
@@ -635,48 +778,78 @@ def main():
         seed=0,
     )
 
+    aaa_base_cfg = AAAConfig(
+        temperature=1.0,   # 建议后续单独调
+        tau=6.0,
+        beta=5.0,
+        kappa=100,
+        lr=0.1,
+        alpha_linear=1.0,
+        alpha_sine=0.7,
+    )
+
     defense_list = [
         DefenseConfig(
             name="single",
-            use_random_shaping=False,
-            shaping_family=("none",),
-            shaping_topk=2,
+            postprocess_type="none",
         ),
+
+        # 你的 shaping
         DefenseConfig(
             name="top2_soft_only",
+            postprocess_type="random_shape",
             use_random_shaping=True,
             shaping_family=("soft_threshold_target",),
             shaping_topk=2,
         ),
         DefenseConfig(
             name="top2_hybrid_only",
+            postprocess_type="random_shape",
             use_random_shaping=True,
             shaping_family=("hybrid_margin_target",),
             shaping_topk=2,
         ),
         DefenseConfig(
             name="top2_random_mix",
+            postprocess_type="random_shape",
             use_random_shaping=True,
             shaping_family=("soft_threshold_target", "hybrid_margin_target"),
             shaping_topk=2,
         ),
         DefenseConfig(
             name="top5_soft_only",
+            postprocess_type="random_shape",
             use_random_shaping=True,
             shaping_family=("soft_threshold_target",),
             shaping_topk=5,
         ),
         DefenseConfig(
             name="top5_hybrid_only",
+            postprocess_type="random_shape",
             use_random_shaping=True,
             shaping_family=("hybrid_margin_target",),
             shaping_topk=5,
         ),
         DefenseConfig(
             name="top5_random_mix",
+            postprocess_type="random_shape",
             use_random_shaping=True,
             shaping_family=("soft_threshold_target", "hybrid_margin_target"),
             shaping_topk=5,
+        ),
+
+        # AAA-linear
+        DefenseConfig(
+            name="aaa_linear",
+            postprocess_type="aaa_linear",
+            aaa_cfg=replace(aaa_base_cfg),
+        ),
+
+        # AAA-sine
+        DefenseConfig(
+            name="aaa_sine",
+            postprocess_type="aaa_sine",
+            aaa_cfg=replace(aaa_base_cfg),
         ),
     ]
 
