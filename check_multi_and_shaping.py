@@ -607,15 +607,21 @@ def defended_forward_for_attacker(
     cross_view_std_sum = None
 
     if not use_multiview:
-        base_logits = model(x)
-        base_cross_view_std = torch.zeros(x.size(0), device=x.device)
-
-        for _ in range(M):
+        base_logits = model(x) #(B,C)
+        base_cross_view_std = torch.zeros(x.size(0), device=x.device)#这里是在构造一个全 0 的张量，长度等于 batch size
+        #形状为（B,）,因为当前分支是 不使用 multiview
+        for _ in range(M):#EOT循环
+            #每次随机选的 shaping family 成员可能不同，所以攻击者不能只看一次输出，而要看：多次随机防御下输出的平均值
             shaping = sample_random_shaping(use_random_shaping, shaping_family)
+            # 如果 use_random_shaping=False
+            # 返回 "none"
+            # 如果 use_random_shaping=True
+            # 从 shaping_family 里随机选一个
 
             if shaping.startswith("semantic_"):
                 shaped_logits = semantic_random_shape_logits(
                     logits=base_logits,
+                    # 每一轮 shaping 都是基于 同一个 base_logits 做的，不是上一轮的结果继续 shaping。
                     text_features=model.text_features,
                     shaping=shaping,
                     tau=6.0,
@@ -628,24 +634,40 @@ def defended_forward_for_attacker(
             else:
                 shaped_logits = random_shape_logits(base_logits, shaping=shaping)
 
-            probs_before = base_logits.softmax(dim=-1)
-            probs_after = shaped_logits.softmax(dim=-1)
-            score_shift = (probs_after - probs_before).abs().sum(dim=1)
+            probs_before = base_logits.softmax(dim=-1) #把原始 logits 转成概率分布。
+            probs_after = shaped_logits.softmax(dim=-1)# 同理，把 shaping 后的 logits 转成概率分布。
+            score_shift = (probs_after - probs_before).abs().sum(dim=1) #score_shift.shape == (B,)
+            #得到每个类别概率的变化量,取绝对值，不管增大还是减小都算变化,对类别维求和，得到每张图总共改动了多少。
+            # 如果某张图：
+            # shaping 前后概率变化很小
+            # score_shift 小
+            # shaping 前后概率变化很大
+            # score_shift 大
 
-            logits_sum = shaped_logits if logits_sum is None else (logits_sum + shaped_logits)
-            score_shift_sum = score_shift if score_shift_sum is None else (score_shift_sum + score_shift)
+            logits_sum = shaped_logits if logits_sum is None else (logits_sum + shaped_logits)#每轮的 shaped_logits 累加起来
+            score_shift_sum = score_shift if score_shift_sum is None else (score_shift_sum + score_shift)#每张图在 M 次 shaping 下的 score_shift 总和
             cross_view_std_sum = base_cross_view_std if cross_view_std_sum is None else (cross_view_std_sum + base_cross_view_std)
+            # 由于当前分支没有 multiview，所以 base_cross_view_std 永远是 0
 
         out_aux = {
             "score_shift_l1": score_shift_sum / float(M),
             "cross_view_std": cross_view_std_sum / float(M),
         }
+            #         这里构造一个辅助字典。
+            # "score_shift_l1"
+            # 表示：
+            # M 次随机 shaping 后，平均每张图的概率分布变化量
+            # 形状是 (B,)
         return logits_sum / float(M), out_aux
+        # 返回 M 次随机 shaping 后的平均 logits,同时记录 shaping 引起的概率变化强度。
 
     if deterministic_views:
         feats_bkd, logits_bkc = collect_view_logits_and_features(model, x, view_list)
+        # 对 x 的每个 view 都跑一遍模型，会生成对应随机变换各生成一个view，然后算对所有类别的 logits z
+        #feats_bkd =(B, K, D)    logits_bkc =(B, K, C)
         base_logits, base_cross_view_std = aggregate_from_view_cache(model, feats_bkd, logits_bkc, agg_type)
-
+        #这里是把刚才 K 个视角的结果聚合起来，得到一个最终的多视角输出,得到的mean logits按 agg——type来。
+        # base_cross_view_std （B,）每张图在不同 view 下，logits 波动有多大(这个值越大,这张图在不同 view 下预测更不稳定)
         for _ in range(M):
             shaping = sample_random_shaping(use_random_shaping, shaping_family)
 
@@ -855,7 +877,7 @@ def eval_defense_family(
     strong_views: bool = True,
     batch_size: int = 8,
     num_workers: int = 4,
-    subset_size: int = 100,
+    subset_size: int = 1000,
     subset_seed: int = 0,
 ):
     view_list = get_view_list(view_mode=view_mode, strong=strong_views)
@@ -910,6 +932,11 @@ def eval_defense_family(
                 shaping_family=list(dcfg.shaping_family),
                 eot_M=attack_cfg.eot_M,
             )
+            # 你前面刚随机初始化了一个 x_adv，现在要先看看：
+            # 这个初始扰动下模型输出是什么
+            # 当前 loss（margin）是多少
+            # 要想知道后面新提议的 x_new 有没有更好，必须先有一个“当前最好”的基准
+
             pred_clean = clean_logits_eval.argmax(dim=1)
             clean_ok = (pred_clean == labels)
             stats[dcfg.name]["clean_correct"] += clean_ok.sum().item()
@@ -1026,6 +1053,12 @@ def main():
             download=True,
             transform=transform,
         ),
+        "cifar10": CIFAR10(
+            root=f"{DATA_ROOT}/cifar10",
+            train=False,
+            download=True,
+            transform=transform,
+        ),
     }
 
     attack_cfg = SquareAttackConfig(
@@ -1066,25 +1099,25 @@ def main():
             use_random_shaping=True,
             shaping_family=("linear", "sine", "competitor_drop"),
         ),
-        DefenseConfig(
-            name="semantic_random_shaping_only",
-            use_multiview=False,
-            agg_type="single",
-            use_random_shaping=True,
-            shaping_family=("semantic_linear", "semantic_sine", "semantic_competitor_drop"),
-        ),
-        DefenseConfig(
-            name="multiview_plus_semantic_random_shaping",
-            use_multiview=True,
-            agg_type="avg_logits",
-            use_random_shaping=True,
-            shaping_family=("semantic_linear", "semantic_sine", "semantic_competitor_drop"),
-        ),
+        # DefenseConfig(
+        #     name="semantic_random_shaping_only",
+        #     use_multiview=False,
+        #     agg_type="single",
+        #     use_random_shaping=True,
+        #     shaping_family=("semantic_linear", "semantic_sine", "semantic_competitor_drop"),
+        # ),
+        # DefenseConfig(
+        #     name="multiview_plus_semantic_random_shaping",
+        #     use_multiview=True,
+        #     agg_type="avg_logits",
+        #     use_random_shaping=True,
+        #     shaping_family=("semantic_linear", "semantic_sine", "semantic_competitor_drop"),
+        # ),
     ]
 
-    batch_size = 8
+    batch_size = 64
     num_workers = 4
-    subset_size = 500
+    subset_size = 1000
     subset_seed = 0
 
     for name, ds in datasets.items():
