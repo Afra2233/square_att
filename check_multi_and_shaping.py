@@ -944,11 +944,19 @@ def eval_defense_family(
 
             pred_clean = clean_logits_eval.argmax(dim=1)
             clean_ok = (pred_clean == labels)
+            # 这里是在把预测标签和真实标签逐个比较。
+            # 比较后得到一个布尔张量 （B,）
             stats[dcfg.name]["clean_correct"] += clean_ok.sum().item()
+            # 这里是在累计“干净样本上预测正确的总数”。
             stats[dcfg.name]["clean_ok_count"] += clean_ok.sum().item()
+            # clean_correct 和clean_ok_count是在算同样的东西，clean_correct 用来算 clean accuracy，clean_ok_count 是拿来算 ASR（attack success rate） 的分母。
 
             cfg_attack = replace(attack_cfg, seed=attack_cfg.seed + batch_idx)
 
+            # 用 square attack 不断修改图片，最后产出一个“尽量能骗过模型”的 x_adv，
+            # 它内部需要 defended_forward_for_attacker，来知道知道“新的扰动是不是更好”
+            # 它会返回最终找到的对抗样本 x_adv，一些攻击过程统计信息 attack_log
+            # 没有返回最终 x_adv 上的 logits / prediction
             x_adv, attack_log = square_attack_with_logging(
                 model=model,
                 x=images,
@@ -957,7 +965,7 @@ def eval_defense_family(
                 defense_cfg=dcfg,
                 view_list=view_list,
             )
-
+            # 好了，攻击已经结束了。现在拿最终得到的 x_adv 再认真测一次，看看模型到底有没有被攻破。
             adv_logits_eval, _ = defended_forward_for_attacker(
                 model=model,
                 x=x_adv,
