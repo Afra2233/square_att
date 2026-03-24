@@ -380,34 +380,16 @@ def random_shape_logits(
 
     k = max(2, min(shaping_topk, C))
     topkv, topki = logits.topk(k=k, dim=1)
-
     top1_val = topkv[:, 0]
 
-    # -----------------------------------------------------
-    # linear / sine
-    # top2: exactly your old logic
-    # top5: apply shaping to top2~top5 competitors w.r.t. top1
-    # -----------------------------------------------------
     if shaping in {"linear", "sine"}:
-        if k == 2:
-            top2_idx = topki[:, 1]
-            top2_val = topkv[:, 1]
-            margin = top1_val - top2_val
-
-            if shaping == "linear":
-                target_margin = margin_to_target_linear(margin, tau=tau, alpha=alpha)
-            else:
-                target_margin = margin_to_target_sine(margin, tau=tau, alpha=alpha)
-
-            delta = (target_margin - margin).clamp(min=-0.8 * margin, max=0.8 * margin)
-            z.scatter_(1, top2_idx.view(-1, 1), (top2_val - delta).view(-1, 1))
-            return z
-
+        # 对 top2 也适用，对 top5 也适用
+        # 唯一差别只是候选 competitor 的数量不同
         for b in range(B):
             z1 = top1_val[b]
             cands = topki[b, 1:].tolist()
 
-            for rank, c in enumerate(cands, start=1):
+            for c in cands:
                 zc = logits[b, c]
                 margin = (z1 - zc).view(1)
 
@@ -421,23 +403,18 @@ def random_shape_logits(
                     max=0.8 * margin,
                 )
 
-                rank_weight = 1.0 / float(rank)
-                z[b, c] = zc - rank_weight * delta.item()
+                # 和 top2 完全同策略：直接对该 competitor 应用同样的 delta 规则
+                z[b, c] = zc - delta.item()
 
         return z
 
-    # -----------------------------------------------------
-    # competitor_drop
-    # top2: only drop top2
-    # top5: drop top2~top5 with rank decay
-    # -----------------------------------------------------
     elif shaping == "competitor_drop":
+        # 同样做最公平版本：不加 rank decay
         for b in range(B):
             cands = topki[b, 1:].tolist()
-            for rank, c in enumerate(cands, start=1):
+            for c in cands:
                 drop = competitor_scale * abs(logits[b, c].item() - top1_val[b].item())
-                rank_weight = 1.0 / float(rank)
-                z[b, c] = logits[b, c] - rank_weight * drop
+                z[b, c] = logits[b, c] - drop
         return z
 
     else:

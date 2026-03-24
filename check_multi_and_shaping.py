@@ -361,8 +361,6 @@ def margin_to_target_sine(margin: torch.Tensor, tau: float, alpha: float) -> tor
     return margin - alpha * tau * torch.sin(np.pi * (1.0 - 2.0 * (margin - attractor) / tau))
 
 
-# @torch.inference_mode()
-# ======================================================================
 @torch.inference_mode()
 def random_shape_logits(
     logits: torch.Tensor,
@@ -370,7 +368,6 @@ def random_shape_logits(
     tau: float = 6.0,
     alpha: float = 0.7,
     competitor_scale: float = 0.15,
-    shaping_topk: int = 2,
 ) -> torch.Tensor:
     if shaping == "none":
         return logits
@@ -381,38 +378,35 @@ def random_shape_logits(
     B, C = logits.shape
     z = logits.clone()
 
-    k = max(2, min(shaping_topk, C))
-    topkv, topki = logits.topk(k=k, dim=1)
-    top1_val = topkv[:, 0]
+    top2v, top2i = logits.topk(k=2, dim=1)
+    top1_idx = top2i[:, 0]
+    top2_idx = top2i[:, 1]
+    top1_val = top2v[:, 0]
+    top2_val = top2v[:, 1]
 
-    if shaping in {"linear", "sine"}:
-        # 对 top2 也适用，对 top5 也适用
-        # 唯一差别只是候选 competitor 的数量不同
-        for b in range(B):
-            z1 = top1_val[b]
-            cands = topki[b, 1:].tolist()
+    # top2v: 每张图最大的两个 logit 值
+    # top2i: 这两个值对应的类别下标
+    # top1_idx: 当前预测类别
+    # top2_idx: 当前第二名类别
+    # top1_val: 第一名 logit
+    # top2_val: 第二名 logit
 
-            for c in cands:
-                zc = logits[b, c]
-                margin = (z1 - zc).view(1)
+    margin = top1_val - top2_val
 
-                if shaping == "linear":
-                    target_margin = margin_to_target_linear(margin, tau=tau, alpha=alpha)
-                else:
-                    target_margin = margin_to_target_sine(margin, tau=tau, alpha=alpha)
+    if shaping == "linear":
+        target_margin = margin_to_target_linear(margin, tau=tau, alpha=alpha)
+        delta = (target_margin - margin).clamp(min=-0.8 * margin, max=0.8 * margin)
+        z.scatter_(1, top2_idx.view(-1, 1), (top2_val - delta).view(-1, 1))
+        return z
 
-                delta = (target_margin - margin).clamp(
-                    min=-0.8 * margin,
-                    max=0.8 * margin,
-                )
-
-                # 和 top2 完全同策略：直接对该 competitor 应用同样的 delta 规则
-                z[b, c] = zc - delta.item()
-
+    elif shaping == "sine":
+        target_margin = margin_to_target_sine(margin, tau=tau, alpha=alpha)
+        delta = (target_margin - margin).clamp(min=-0.8 * margin, max=0.8 * margin)
+        z.scatter_(1, top2_idx.view(-1, 1), (top2_val - delta).view(-1, 1))
         return z
 
     elif shaping == "competitor_drop":
-        # 同样做最公平版本：不加 rank decay
+        topkv, topki = logits.topk(k=min(5, C), dim=1)
         for b in range(B):
             cands = topki[b, 1:].tolist()
             for c in cands:
@@ -422,61 +416,6 @@ def random_shape_logits(
 
     else:
         raise ValueError(f"Unknown shaping: {shaping}")
-    # ======================================================================
-# def random_shape_logits(
-#     logits: torch.Tensor,
-#     shaping: ShapingType,
-#     tau: float = 6.0,
-#     alpha: float = 0.7,
-#     competitor_scale: float = 0.15,
-# ) -> torch.Tensor:
-#     if shaping == "none":
-#         return logits
-
-#     if shaping not in {"linear", "sine", "competitor_drop"}:
-#         raise ValueError(f"Unsupported non-semantic shaping: {shaping}")
-
-#     B, C = logits.shape
-#     z = logits.clone()
-
-#     top2v, top2i = logits.topk(k=2, dim=1)
-#     top1_idx = top2i[:, 0]
-#     top2_idx = top2i[:, 1]
-#     top1_val = top2v[:, 0]
-#     top2_val = top2v[:, 1]
-
-#     # top2v: 每张图最大的两个 logit 值
-#     # top2i: 这两个值对应的类别下标
-#     # top1_idx: 当前预测类别
-#     # top2_idx: 当前第二名类别
-#     # top1_val: 第一名 logit
-#     # top2_val: 第二名 logit
-
-#     margin = top1_val - top2_val
-
-#     if shaping == "linear":
-#         target_margin = margin_to_target_linear(margin, tau=tau, alpha=alpha)
-#         delta = (target_margin - margin).clamp(min=-0.8 * margin, max=0.8 * margin)
-#         z.scatter_(1, top2_idx.view(-1, 1), (top2_val - delta).view(-1, 1))
-#         return z
-
-#     elif shaping == "sine":
-#         target_margin = margin_to_target_sine(margin, tau=tau, alpha=alpha)
-#         delta = (target_margin - margin).clamp(min=-0.8 * margin, max=0.8 * margin)
-#         z.scatter_(1, top2_idx.view(-1, 1), (top2_val - delta).view(-1, 1))
-#         return z
-
-#     elif shaping == "competitor_drop":
-#         topkv, topki = logits.topk(k=min(5, C), dim=1)
-#         for b in range(B):
-#             cands = topki[b, 1:].tolist()
-#             for c in cands:
-#                 drop = competitor_scale * abs(logits[b, c].item() - top1_val[b].item())
-#                 z[b, c] = logits[b, c] - drop
-#         return z
-
-#     else:
-#         raise ValueError(f"Unknown shaping: {shaping}")
 
 
 @torch.inference_mode()
