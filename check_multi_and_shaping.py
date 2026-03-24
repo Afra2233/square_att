@@ -345,9 +345,7 @@ ShapingType = Literal[
     "linear",
     "sine",
     "competitor_drop",
-    "semantic_linear",
-    "semantic_sine",
-    "semantic_competitor_drop",
+
 ]
 
 
