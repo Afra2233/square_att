@@ -386,6 +386,13 @@ def random_shape_logits(
     top1_val = top2v[:, 0]
     top2_val = top2v[:, 1]
 
+    # top2v: 每张图最大的两个 logit 值
+    # top2i: 这两个值对应的类别下标
+    # top1_idx: 当前预测类别
+    # top2_idx: 当前第二名类别
+    # top1_val: 第一名 logit
+    # top2_val: 第二名 logit
+
     margin = top1_val - top2_val
 
     if shaping == "linear":
@@ -1090,14 +1097,16 @@ def main():
             use_multiview=False,
             agg_type="single",
             use_random_shaping=True,
-            shaping_family=("linear", "sine", "competitor_drop"),
+            # shaping_family=("linear", "sine", "competitor_drop"),
+            shaping_family=("linear", "sine"),
         ),
         DefenseConfig(
             name="multiview_plus_random_shaping",
             use_multiview=True,
             agg_type="avg_logits",
             use_random_shaping=True,
-            shaping_family=("linear", "sine", "competitor_drop"),
+            # shaping_family=("linear", "sine", "competitor_drop"),
+            shaping_family=("linear", "sine"),
         ),
         # DefenseConfig(
         #     name="semantic_random_shaping_only",
