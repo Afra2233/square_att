@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as TF
 from torchvision.datasets import CIFAR10, CIFAR100, Food101, STL10
 
 import clip
@@ -73,34 +72,19 @@ def make_subset_loader(
 # Build CLIP Text Features
 # =========================================================
 @torch.inference_mode()
-def build_text_features(class_names, clip_model, device, dataset_name: str):
-    dname = dataset_name.lower()
-
-    if dname == "food101":
-        templates = [
-            "a photo of {}",
-            
-        ]
-    elif dname == "stl10":
-        templates = [
-            "a photo of a {}",
-            
-        ]
-    else:
-        templates = [
-            "a photo of a {}",
-           
-        ]
+def build_text_features(class_names, clip_model, device):
+    template = "a photo of a {}"
 
     all_text_features = []
     for c in class_names:
         name = c.replace("_", " ")
-        prompts = [t.format(name) for t in templates]
-        tokens = clip.tokenize(prompts).to(device)
-        text_feats = clip_model.encode_text(tokens)
-        text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
-        text_feat = text_feats.mean(dim=0)
-        text_feat = text_feat / text_feat.norm()
+        prompt = template.format(name)
+        tokens = clip.tokenize([prompt]).to(device)
+
+        text_feat = clip_model.encode_text(tokens)
+        text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+        text_feat = text_feat.squeeze(0)
+
         all_text_features.append(text_feat)
 
     text_features = torch.stack(all_text_features, dim=0)
@@ -139,144 +123,39 @@ class CLIPZeroShot(nn.Module):
 
 
 # =========================================================
-# Views (kept for compatibility, but not used in this script)
-# =========================================================
-ViewType = Literal[
-    "identity",
-    "horizontal_flip",
-    "resize_pad_96",
-    "center_crop_96",
-    "rotation_fixed_plus8",
-    "blur_fixed_sigma_0p6",
-    "rotation_rand_8",
-    "blur_rand_light",
-]
-
-ViewMode = Literal["deterministic", "stochastic"]
-
-
-@torch.inference_mode()
-def apply_view_batch(x: torch.Tensor, view_t: ViewType) -> torch.Tensor:
-    if view_t == "identity":
-        return x
-
-    B, C, H, W = x.shape
-    out = []
-
-    for i in range(B):
-        xi = x[i]
-
-        if view_t == "horizontal_flip":
-            xo = TF.hflip(xi)
-
-        elif view_t == "resize_pad_96":
-            new_h = max(1, int(round(H * 0.96)))
-            new_w = max(1, int(round(W * 0.96)))
-            resized = TF.resize(
-                xi,
-                size=[new_h, new_w],
-                interpolation=InterpolationMode.BILINEAR,
-                antialias=True,
-            )
-            pad_top = (H - new_h) // 2
-            pad_bottom = H - new_h - pad_top
-            pad_left = (W - new_w) // 2
-            pad_right = W - new_w - pad_left
-            xo = TF.pad(
-                resized,
-                [pad_left, pad_top, pad_right, pad_bottom],
-                fill=float(xi.mean()),
-            )
-
-        elif view_t == "center_crop_96":
-            crop_h = max(1, int(round(H * 0.96)))
-            crop_w = max(1, int(round(W * 0.96)))
-            top = (H - crop_h) // 2
-            left = (W - crop_w) // 2
-            cropped = xi[:, top:top + crop_h, left:left + crop_w]
-            xo = TF.resize(
-                cropped,
-                size=[H, W],
-                interpolation=InterpolationMode.BILINEAR,
-                antialias=True,
-            )
-
-        elif view_t == "rotation_fixed_plus8":
-            xo = TF.rotate(
-                xi,
-                angle=8.0,
-                interpolation=InterpolationMode.BILINEAR,
-                expand=False,
-                fill=float(xi.mean()),
-            )
-
-        elif view_t == "blur_fixed_sigma_0p6":
-            kernel_size = 3 if min(H, W) < 128 else 5
-            xo = TF.gaussian_blur(xi, kernel_size=[kernel_size, kernel_size], sigma=0.6)
-
-        elif view_t == "rotation_rand_8":
-            angle = random.uniform(-8.0, 8.0)
-            xo = TF.rotate(
-                xi,
-                angle=angle,
-                interpolation=InterpolationMode.BILINEAR,
-                expand=False,
-                fill=float(xi.mean()),
-            )
-
-        elif view_t == "blur_rand_light":
-            kernel_size = 3 if min(H, W) < 128 else 5
-            sigma = random.uniform(0.1, 1.0)
-            xo = TF.gaussian_blur(xi, kernel_size=[kernel_size, kernel_size], sigma=sigma)
-
-        else:
-            raise ValueError(f"Unknown view type: {view_t}")
-
-        out.append(xo.clamp(0.0, 1.0))
-
-    return torch.stack(out, dim=0)
-
-
-# =========================================================
-# Non-semantic shaping family
+# Active reconstruction shaping
 # =========================================================
 ShapingType = Literal[
     "none",
-    "hinge_margin",
-    "exp_repulsion",
+    "soft_threshold_target",
+    "hybrid_margin_target",
 ]
 
 
 @torch.inference_mode()
-def competitor_hinge_delta(
+def target_margin_soft_threshold(
     margin: torch.Tensor,
     gamma: float = 3.0,
-    lam: float = 0.5,
-    max_delta_ratio: float = 0.8,
+    alpha: float = 0.7,
 ) -> torch.Tensor:
     """
-    margin = z_top1 - z_c
-    If margin < gamma, suppress the competitor.
+    m* = m + alpha * max(0, gamma - m)
+    If margin is below gamma, move it partially toward gamma.
     """
-    delta = lam * torch.clamp(gamma - margin, min=0.0)
-    delta = torch.clamp(delta, max=max_delta_ratio * margin.clamp_min(1e-12))
-    return delta
+    return margin + alpha * torch.clamp(gamma - margin, min=0.0)
 
 
 @torch.inference_mode()
-def competitor_exp_delta(
+def target_margin_hybrid(
     margin: torch.Tensor,
-    lam: float = 0.5,
-    tau: float = 2.0,
-    max_delta_ratio: float = 0.8,
+    gamma: float = 3.0,
+    rho: float = 1.5,
 ) -> torch.Tensor:
     """
-    margin = z_top1 - z_c
-    Smaller margin -> larger suppression.
+    m* = max(rho * m, gamma)
+    Enforce either relative amplification or a minimum safe margin.
     """
-    delta = lam * torch.exp(-margin / tau)
-    delta = torch.clamp(delta, max=max_delta_ratio * margin.clamp_min(1e-12))
-    return delta
+    return torch.maximum(rho * margin, torch.full_like(margin, gamma))
 
 
 @torch.inference_mode()
@@ -285,14 +164,14 @@ def random_shape_logits(
     shaping: ShapingType,
     shaping_topk: int = 2,
     gamma: float = 3.0,
-    lam: float = 0.5,
-    tau: float = 2.0,
+    alpha: float = 0.7,
+    rho: float = 1.5,
     max_delta_ratio: float = 0.8,
 ) -> torch.Tensor:
     if shaping == "none":
         return logits
 
-    if shaping not in {"hinge_margin", "exp_repulsion"}:
+    if shaping not in {"soft_threshold_target", "hybrid_margin_target"}:
         raise ValueError(f"Unsupported shaping: {shaping}")
 
     B, C = logits.shape
@@ -302,7 +181,6 @@ def random_shape_logits(
     topkv, topki = logits.topk(k=k, dim=1)
     top1_val = topkv[:, 0]
 
-    # fair top2-vs-top5: same per-competitor rule, only scope changes
     for b in range(B):
         z1 = top1_val[b]
         cands = topki[b, 1:].tolist()
@@ -311,20 +189,25 @@ def random_shape_logits(
             zc = logits[b, c]
             margin = (z1 - zc).view(1)
 
-            if shaping == "hinge_margin":
-                delta = competitor_hinge_delta(
+            if shaping == "soft_threshold_target":
+                target_margin = target_margin_soft_threshold(
                     margin=margin,
                     gamma=gamma,
-                    lam=lam,
-                    max_delta_ratio=max_delta_ratio,
+                    alpha=alpha,
                 )
             else:
-                delta = competitor_exp_delta(
+                target_margin = target_margin_hybrid(
                     margin=margin,
-                    lam=lam,
-                    tau=tau,
-                    max_delta_ratio=max_delta_ratio,
+                    gamma=gamma,
+                    rho=rho,
                 )
+
+            delta = target_margin - margin
+            delta = torch.clamp(
+                delta,
+                min=torch.zeros_like(delta),
+                max=max_delta_ratio * margin.clamp_min(1e-12),
+            )
 
             z[b, c] = zc - delta.item()
 
@@ -338,12 +221,12 @@ def sample_random_shaping(
 ) -> ShapingType:
     if not enable_random_shaping:
         return "none"
-    family = family or ["hinge_margin", "exp_repulsion"]
+    family = family or ["soft_threshold_target", "hybrid_margin_target"]
     return random.choice(family)
 
 
 # =========================================================
-# Unified defended prediction (single-view only here)
+# Unified defended prediction (single-view only)
 # =========================================================
 @torch.inference_mode()
 def defended_predict(
@@ -370,8 +253,8 @@ def defended_predict(
 
     shaping_id_map = {
         "none": 0,
-        "hinge_margin": 1,
-        "exp_repulsion": 2,
+        "soft_threshold_target": 1,
+        "hybrid_margin_target": 2,
     }
     aux["shaping_id"] = torch.full(
         (x.size(0),), shaping_id_map[shaping], device=x.device, dtype=torch.long
@@ -582,8 +465,8 @@ def eval_defense_family(
     subset_seed: int = 0,
 ):
     print(f"\n===== {name} | subset={subset_size} | attack=adaptive square | single-view only =====")
-    print(f"Final clean/robust accuracy: EOT-averaged defended accuracy")
-    print(f"EOT includes random shaping: YES")
+    print("Final clean/robust accuracy: EOT-averaged defended accuracy")
+    print("EOT includes random shaping: YES")
 
     loader = make_subset_loader(
         ds=ds,
@@ -759,44 +642,40 @@ def main():
             shaping_family=("none",),
             shaping_topk=2,
         ),
-
-        # top2
         DefenseConfig(
-            name="top2_hinge_only",
+            name="top2_soft_only",
             use_random_shaping=True,
-            shaping_family=("hinge_margin",),
+            shaping_family=("soft_threshold_target",),
             shaping_topk=2,
         ),
         DefenseConfig(
-            name="top2_exp_only",
+            name="top2_hybrid_only",
             use_random_shaping=True,
-            shaping_family=("exp_repulsion",),
+            shaping_family=("hybrid_margin_target",),
             shaping_topk=2,
         ),
         DefenseConfig(
             name="top2_random_mix",
             use_random_shaping=True,
-            shaping_family=("hinge_margin", "exp_repulsion"),
+            shaping_family=("soft_threshold_target", "hybrid_margin_target"),
             shaping_topk=2,
         ),
-
-        # top5
         DefenseConfig(
-            name="top5_hinge_only",
+            name="top5_soft_only",
             use_random_shaping=True,
-            shaping_family=("hinge_margin",),
+            shaping_family=("soft_threshold_target",),
             shaping_topk=5,
         ),
         DefenseConfig(
-            name="top5_exp_only",
+            name="top5_hybrid_only",
             use_random_shaping=True,
-            shaping_family=("exp_repulsion",),
+            shaping_family=("hybrid_margin_target",),
             shaping_topk=5,
         ),
         DefenseConfig(
             name="top5_random_mix",
             use_random_shaping=True,
-            shaping_family=("hinge_margin", "exp_repulsion"),
+            shaping_family=("soft_threshold_target", "hybrid_margin_target"),
             shaping_topk=5,
         ),
     ]
@@ -809,7 +688,7 @@ def main():
     for name, ds in datasets.items():
         print(f"\nPreparing: {name}")
         class_names = get_class_list(name, ds)
-        text_features = build_text_features(class_names, clip_model, device, dataset_name=name)
+        text_features = build_text_features(class_names, clip_model, device)
 
         eval_defense_family(
             name=name,
