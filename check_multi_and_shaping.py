@@ -1046,7 +1046,7 @@ def main():
 
     batch_size = 64
     num_workers = 4
-    subset_size = 1000
+    subset_size = 500
     subset_seed = 0
 
     for name, ds in datasets.items():
