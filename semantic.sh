@@ -12,7 +12,7 @@ source activate square_att
 cd /scratch/hpc/07/zhang303/square_att
 
 
-srun python semantic.py \
+srun python sementic.py \
   --dataset cifar10 \
   --data-root ./data \
   --model ViT-B-32 \
