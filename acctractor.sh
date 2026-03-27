@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=30G
 #SBATCH --cpus-per-task=4
-
+#SBATCH --time=48:00:00
 module load anaconda3/2022.05 
 source activate square_att
 cd /scratch/hpc/07/zhang303/square_att
