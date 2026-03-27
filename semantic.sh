@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p gpu-short
+#SBATCH -p gpu-medium
 #SBATCH --nodes=1
 
 #SBATCH --ntasks=1  
